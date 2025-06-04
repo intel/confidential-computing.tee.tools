@@ -1,0 +1,48 @@
+#!/bin/bash
+
+# Copyright (C) 2025 Intel Corporation
+# SPDX-License-Identifier: BSD-3-Clause
+
+PART_ROOT=$1
+LABEL_PART_ROOTFS_ENC=$2
+LABEL_DEV_ROOTFS_DEC=$3
+
+set -e
+
+echo "Guest OS installation script called with PART_ROOT=${PART_ROOT}, LABEL_PART_ROOTFS_ENC=${LABEL_PART_ROOTFS_ENC}, LABEL_DEV_ROOTFS_DEC=${LABEL_DEV_ROOTFS_DEC}"
+
+## Install packages
+apt update && apt install --yes --allow-downgrades shim-signed grub-efi-amd64-signed grub-efi-amd64-bin libtdx-attest-dev
+
+# Install Grub2
+grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=ubuntu
+
+# Configure kernel command line.
+cryptdevice_cmdline="cryptdevice=UUID=$(blkid -o value -s UUID $PART_ROOT):${LABEL_DEV_ROOTFS_DEC}"
+sed -i "s|\(^GRUB_CMDLINE_LINUX_DEFAULT=\"\)\(.*\)|\1${cryptdevice_cmdline} \2|" \
+    /etc/default/grub.d/50-cloudimg-settings.cfg
+
+echo "CMDLINE: $CMDLINE"
+echo "=== Grub setting start ==="
+cat "/etc/default/grub.d/50-cloudimg-settings.cfg"
+echo "=== Grub setting end ==="
+
+# Set mount information for partitions.
+cat <<EOF >/etc/fstab
+LABEL=${LABEL_PART_ROOTFS_ENC}    /               ext4   discard,errors=remount-ro       0 1
+LABEL=boot          /boot           ext4   defaults                        0 1
+LABEL=uefi          /boot/efi       vfat   umask=0077                      0 1
+EOF
+
+# Remove all other operating systems from GRUB menu.
+mv /etc/grub.d/30_os-prober /etc/grub.d/.30_os-prober
+update-grub
+mv /etc/grub.d/.30_os-prober /etc/grub.d/30_os-prober
+
+# Update the initial RAM filesystem (initramfs) for all installed kernels.
+# In particular, this executes all the hooks in the folder initramfs/hooks.
+update-initramfs -u -k all
+
+# Generates new host keys for all key types that do not have host keys yet.
+# This is important for ensuring secure SSH access to the system.
+ssh-keygen -A

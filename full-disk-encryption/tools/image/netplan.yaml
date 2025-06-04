@@ -1,0 +1,12 @@
+# Copyright (C) 2025 Intel Corporation
+# SPDX-License-Identifier: BSD-3-Clause
+
+network:
+    version: 2
+    renderer: networkd
+    ethernets:
+        en:
+            match:
+                name: "en*"
+            dhcp4: true
+            dhcp-identifier: mac

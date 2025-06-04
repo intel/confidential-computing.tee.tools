@@ -1,0 +1,10 @@
+.vscode/
+fde-binaries/target
+ita-kbs/
+canonical-tdx/
+data/
+tools/image/*.fd
+tools/image/*.tar.xz
+tools/image/*.img
+tools/image/my_venv
+tools/image/kbs_url

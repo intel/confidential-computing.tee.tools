@@ -1,0 +1,49 @@
+# Copyright (C) 2025 Intel Corporation
+# SPDX-License-Identifier: BSD-3-Clause
+
+[package]
+name = "fde-binaries"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "fde-decrypt-image"
+path = "src/fde-decrypt-image.rs"
+
+[[bin]]
+name = "fde-key-gen"
+path = "src/fde-key-gen.rs"
+
+[lib]
+name = "utils"
+path = "src/util_modules/lib.rs"
+
+[profile.release]
+strip = true  # Automatically strip symbols from the binary
+
+[dependencies]
+base64 = "0.22.1"
+clap = { version = "4.5.38", features = ["derive"] }
+cryptsetup-rs = "0.3.2"
+log = "0.4.27"
+anyhow = "1.0.98"
+reqwest = { version = "0.12.15", features = ["rustls-tls", "json", "blocking"], default-features = false}
+rustls = "0.23.27"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+tokio = { version = "1.45.0", features = ["rt-multi-thread", "macros"] }
+efivar = "2.0.0"
+uuid = {version = "1.16.0", features = ["v5", "macro-diagnostics"]}
+zeroize = "1.8.1"
+webpki-roots = "1.0.0"
+rsa = { version = "0.9.8", features = ["sha2", "pem"] }
+pkcs1 = "0.7.5"
+sha2 = "0.10.9"
+rand = "0.9.1"
+aes-gcm = "0.10.3"
+generic-array = "1.2.0"
+tdx-attest-rs = { git = "https://github.com/intel/SGXDataCenterAttestationPrimitives", tag = "DCAP_1.21" }
+hex = "0.4.3"
+
+[build-dependencies]
+pkg-config = "0.3.32"

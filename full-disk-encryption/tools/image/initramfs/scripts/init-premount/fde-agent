@@ -1,0 +1,79 @@
+#!/bin/sh
+
+# Copyright (C) 2025 Intel Corporation
+# SPDX-License-Identifier: BSD-3-Clause
+
+PREREQ="cloud-initramfs-dyn-netconf"
+prereqs() {
+    echo "$PREREQ"
+}
+
+case $1 in
+prereqs)
+    prereqs
+    exit 0
+    ;;
+esac
+
+# shellcheck disable=SC1091
+. /scripts/functions
+
+# Set panic timeout to 1s to enforce a reboot instead of dropping to debug console.
+# This is an important security setting.
+# As TDs cannot reboot, the TD will terminate.
+panic=1
+
+# Mount efivars to get EFI variables
+mount -t efivarfs efivarfs /sys/firmware/efi/efivars
+
+# Configure the network
+configure_networking
+
+# Parse command line to get cryptdevice
+CMDLINE=$(cat /proc/cmdline)
+for x in $CMDLINE; do
+    case $x in
+    cryptdevice=*)
+        # Read UUID of encrypted root filesystem and label of device used after decryption from cryptdevice parameter passed via command line.
+        CRYPTDEVICE=${x#cryptdevice=}
+        oldIFS=$IFS
+        IFS=':'
+        set -- ${CRYPTDEVICE}
+        UUID_PART_ROOTFS=$1
+        LABEL_DEV_ROOTFS_DEC=$2
+        IFS=$oldIFS
+        ;;
+    esac
+done
+
+# Check if UUID of of encrypted root filesystem was provided.
+# If this is the case, use resolve_device function, which is defined in /scripts/functions, to covert passed UUID of encrypted root filesystem to corresponding device name.
+# resolve_device writes the result to a variable named DEV.
+# Finally convert device name of encrypted root filesystem to input parameter expected by fde-decrypt-image.
+# Otherwise, panic.
+if [ -n "${UUID_PART_ROOTFS}" ]; then
+    resolve_device "${UUID_PART_ROOTFS}"
+    LABEL_PART_ROOTFS_ENC="${DEV}"
+else
+    panic "UUID of root filesystem not provided"
+fi
+
+# Check if labels for virtual device providing decrypted access to encrypted root partition was provided.
+if [ -z "${LABEL_DEV_ROOTFS_DEC}" ]; then
+    panic "UUID of root filesystem not provided"
+fi
+
+# Check if fde-decrypt-image script is present and executable.
+if [ ! -x "/sbin/fde-decrypt-image" ]; then
+    panic "FDE decrypt executable not found"
+fi
+
+# Configure TD to QGS communication channel.
+echo "port=4050" >/etc/tdx-attest.conf
+
+# Call image FDE decryption script.
+fde_decrypt_image_params="--label-part-rootfs-enc ${LABEL_PART_ROOTFS_ENC} --label-dev-rootfs-dec ${LABEL_DEV_ROOTFS_DEC}"
+log_begin_msg "Calling fde-decrypt-image script with parameters \"${fde_decrypt_image_params}\""
+/sbin/fde-decrypt-image ${fde_decrypt_image_params} || panic "Abort execution"
+
+log_end_msg

@@ -1,0 +1,78 @@
+diff --git a/guest-tools/run_td.sh b/guest-tools/run_td.sh
+index 5681bf5..3bd2efd 100755
+--- a/guest-tools/run_td.sh
++++ b/guest-tools/run_td.sh
+@@ -35,6 +35,48 @@ fi
+ UBUNTU_VERSION=$(lsb_release -rs)
+ TD_IMG=${TD_IMG:-${PWD}/image/tdx-guest-ubuntu-${UBUNTU_VERSION}-generic.qcow2}
+ TDVF_FIRMWARE=/usr/share/ovmf/OVMF.fd
++DAEMONIZE=true
++CONSOLE="-daemonize"
++
++process_args() {
++    while getopts ":h:f:d:" option; do
++        case "$option" in
++            f) TDVF_FIRMWARE=$OPTARG;;
++            d) DAEMONIZE=false;;
++            h) usage
++               exit 0
++               ;;
++            *)
++               echo "Invalid option '-$OPTARG'"
++               usage
++               exit 1
++               ;;
++        esac
++    done
++}
++
++usage() {
++    cat << EOM
++Usage: $(basename "$0") [OPTION]...
++  -f <TDVF_FIRMWARE>        Virtual Firmware device file for "TD"
++  -d <DAEMONIZE>            Run TD in daemonize mode?. Valid values [true/false], default=true
++  -h                        Show this help
++EOM
++}
++
++process_args "$@"
++
++if [ "$DAEMONIZE" = false ] ; then
++    CONSOLE="-chardev stdio,id=mux,mux=on \
++        -device virtio-serial,romfile= \
++        -device virtconsole,chardev=mux -monitor chardev:mux \
++        -serial chardev:mux "
++fi
++
++if [[ ! -f $TDVF_FIRMWARE ]]; then
++    echo "Could not find $TDVF_FIRMWARE. Please specify the TDVF_FIRMWARE file path."
++    exit 0
++fi
+
+ if ! groups | grep -qw "kvm"; then
+     echo "Please add user $USER to kvm group to run this script (usermod -aG kvm $USER and then log in again)."
+@@ -57,7 +99,8 @@ qemu-system-x86_64 -D $LOGFILE \
+ 		   -object '{"qom-type":"tdx-guest","id":"tdx","quote-generation-socket":{"type": "vsock", "cid":"2","port":"4050"}}' \
+ 		   -machine q35,kernel_irqchip=split,confidential-guest-support=tdx,hpet=off \
+ 		   -bios ${TDVF_FIRMWARE} \
+-		   -nographic -daemonize \
++		   -nographic \
++		   ${CONSOLE} \
+ 		   -nodefaults \
+ 		   -device virtio-net-pci,netdev=nic0_td -netdev user,id=nic0_td,hostfwd=tcp::${SSH_PORT}-:22 \
+ 		   -drive file=${TD_IMG},if=none,id=virtio-disk0 \
+@@ -71,8 +114,9 @@ if [ $ret -ne 0 ]; then
+ 	exit $ret
+ fi
+
+-PID_TD=$(cat /tmp/tdx-demo-td-pid.pid)
+-
+-echo "TD started by QEMU with PID: ${PID_TD}.
+-To log in with the non-root user (default: tdx / password: 123456), as specified in setup-tdx-config, use: $ ssh -p ${SSH_PORT} <username>@localhost
+-To log in as root (default password: 123456), use: $ ssh -p ${SSH_PORT} root@localhost"
++if [ "$DAEMONIZE" = true ] ; then
++    PID_TD=$(cat /tmp/tdx-demo-td-pid.pid)
++    echo "TD started by QEMU with PID: ${PID_TD}.
++	To log in with the non-root user (default: tdx / password: 123456), as specified in setup-tdx-config, use: $ ssh -p ${SSH_PORT} <username>@localhost
++	To log in as root (default password: 123456), use: $ ssh -p ${SSH_PORT} root@localhost"
++fi

@@ -1,0 +1,22 @@
+#!/bin/sh
+
+# Copyright (C) 2025 Intel Corporation
+# SPDX-License-Identifier: BSD-3-Clause
+
+PREREQ="cloud-initramfs-dyn-netconf"
+prereqs() {
+    echo "$PREREQ"
+}
+
+case $1 in
+prereqs)
+    prereqs
+    exit 0
+    ;;
+esac
+
+# shellcheck disable=SC1091
+. /usr/share/initramfs-tools/hook-functions
+
+# Copy KBS certificate into initramfs.
+copy_file regular /etc/kbs.crt /etc/
