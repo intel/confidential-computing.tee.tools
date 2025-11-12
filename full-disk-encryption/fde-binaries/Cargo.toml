@@ -42,7 +42,7 @@ sha2 = "0.10.9"
 rand = "0.9.1"
 aes-gcm = "0.10.3"
 generic-array = "1.2.0"
-tdx-attest-rs = { git = "https://github.com/intel/SGXDataCenterAttestationPrimitives", tag = "DCAP_1.21" }
+tdx-attest-rs = { git = "https://github.com/intel/SGXDataCenterAttestationPrimitives", tag = "DCAP_1.23" }
 hex = "0.4.3"
 
 [build-dependencies]
