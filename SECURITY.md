@@ -18,11 +18,13 @@ The secure management of cryptographic keys, certificates, and other secrets is 
 The methods shown, such as storing keys as plaintext files or using environment variables, are for convenience in a development setting and are not representative of a secure production deployment.
 
 Users are responsible for securing sensitive assets, including but not limited to:
-- **Private Keys**: `sk_kr.pem`
-- **Secrets**: `VAULT_ROOT_TOKEN`, `tmp_k_rfs`, `k_rfs`
-- **Certificates**: `tls.crt`
+- **Private Keys**: `kbs.key.pem`, `sk_kbs_admin.pem`
+- **Secrets**: `VAULT_ROOT_TOKEN`, `k_RFS`
+- **Certificates**: `kbs.cert.pem`
 
-Users should evaluate security, performance, and suitability requirements before deployment.
+This solution uses the cryptographic algorithms ECC-256 and Ed25519 due to dependencies on the underlying Trustee Key Broker Service (KBS).
+These algorithms are provided for reference purposes.
+Users should evaluate their security, performance, and suitability requirements before deployment.
 
 ### Suggestions for Production Environments
 
