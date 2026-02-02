@@ -513,7 +513,24 @@ Please adjust the commands according to your environment.
     > sudo ln -f /lib/x86_64-linux-gnu/libm-2.39.a /lib/x86_64-linux-gnu/libm.a
     > ```
 
-4. [On Preparation Host] Create TD image TD<sub>W</sub> with workload, a dummy key used for FDE, and key pair used for key retrieval from Trustee KBS:
+4. [On Preparation Host] Generate root filesystem encryption key (k<sub>RFS</sub>) and corresponding key id (ID<sub>K_RFS</sub>).
+    ```
+    k_RFS=$(openssl rand -hex 64)
+    ID_K_RFS="keybroker/key/$(openssl rand -hex 32)"
+    ```
+
+    > NOTE: We first do the encryption with a dummy key, but we already have to enroll the final key ID into the OVMF image used for the dummy encryption.
+
+    - Optionally, use the following command to check the uniqueness of the key id (ID<sub>K_RFS</sub>) in KMS.
+        ```
+        docker exec -e VAULT_ADDR="http://127.0.0.1:8200" -e VAULT_TOKEN="$VAULT_ROOT_TOKEN" trustee-vault \
+            vault kv get -mount=keybroker $ID_K_RFS
+        ```
+
+        The output `No value found at keybroker/<key-id>` indicates that the specified key id does not exist in the keybroker path and is therefore unused.
+        For any other result, generate another key id to prevent that an existing key is overwritten.
+
+5. [On Preparation Host] Create TD image TD<sub>W</sub> with workload, a dummy key used for FDE:
     - Activate automatic attestation packages installation inside of the image:
         ```
         sed -i "s/^TDX_SETUP_ATTESTATION=0$/TDX_SETUP_ATTESTATION=1/" canonical-tdx/setup-tdx-config
@@ -557,7 +574,9 @@ Please adjust the commands according to your environment.
             -p $PWD/canonical-tdx/guest-tools/image/tdx-guest-ubuntu-24.04-generic.qcow2 \
             -e $PWD/tools/image/tdx-guest-ubuntu-24.04-encrypted.img \
             -d $PWD/data/tmp_k_rfs \
-            -c $KBS_CERT_PATH
+            -c $KBS_CERT_PATH \
+            -i $ID_K_RFS \
+            -u $KBS_URL
         ```
 
         > NOTE: The dummy TD image TD<sub>W</sub> requires enough disk space for the following pieces: (1) space for data from the (enriched) base image TD<sub>B</sub>, (2) space for data generated at runtime, and (3) space for encryption overhead of approximately 1GB.
@@ -570,10 +589,9 @@ Please adjust the commands according to your environment.
         - creates a LUKS2 encrypted partition using the provided dummy key,
         - formats the partitions,
         - fills the encrypted partition with data from the base image TD<sub>B</sub> and FDE binaries,
-        - enrolls the TD boot mode `GET_QUOTE` into an OVMF image.
+        - enrolls the KBS URL and the key ID (ID<sub>K_RFS</sub>) corresponding to root filesystem encryption key (k<sub>RFS</sub>) into an OVMF image.
 
         In a later step, the dummy key for the LUKS2 partition is replaced by actual key.
-        Note that changing OVMF variables does not change TD measurements.
 
         Script will print the updated OVMF file path and the updated encrypted image path.
 
@@ -584,7 +602,7 @@ Please adjust the commands according to your environment.
         IMAGE_PATH: <Path to encrypted image file>
         ```
 
-5. [**On Workload Host**] Download FDE solution and move into its directory:
+6. [**On Workload Host**] Download FDE solution and move into its directory:
     ```
     git clone --recurse-submodules https://github.com/intel/confidential-computing.tee.tools.git fde
     pushd fde/full-disk-encryption/
@@ -592,18 +610,18 @@ Please adjust the commands according to your environment.
 
     > NOTE: This will also clone Trustee's repository with tag `v0.15.0` and Canonical's Intel TDX repository with tag `3.1` inside `full-disk-encryption` directory.
 
-6. [On Workload Host] Patch the TD launch script:
+7. [On Workload Host] Patch the TD launch script:
     ```
     git -C canonical-tdx apply ../patches/run_td_sh.patch
     ```
 
-7. [On Workload Host] Boot TD<sub>W</sub> combined with the OVMF image `OVMF_GET_QUOTE.fd`.
+8. [On Workload Host] Boot TD<sub>W</sub> combined with the OVMF image `OVMF_FDE.fd`.
     Make sure the respective TD image and OVMF binaries are copied to Workload Host and the paths match the following command:
     ```
     TD_IMG=tools/image/tdx-guest-ubuntu-24.04-encrypted.img \
         canonical-tdx/guest-tools/run_td.sh \
         -d false \
-        -f tools/image/OVMF_GET_QUOTE.fd
+        -f tools/image/OVMF_FDE.fd
     ```
 
     During boot, FDE Agent retrieves a TD Quote, prints the TD Quote in an export command, and stops further boot.
@@ -623,29 +641,10 @@ Please adjust the commands according to your environment.
     > NOTE: "panic=1" is used by the FDE Agent to kill the TD on every error.
     > This is an important security feature for production systems, but you might want to remove it during debug sessions.
 
-8. [**On Preparation Host**] Export TD Quote returned by last command:
+9. [**On Preparation Host**] Export TD Quote returned by last command:
     ```
     export QUOTE=<base64 encoded TD quote>
     ```
-
-9. [On Preparation Host] Generate root filesystem encryption key (k<sub>RFS</sub>) and corresponding key id (ID<sub>K_RFS</sub>).
-    - Generate root filesystem encryption key:
-        ```
-        k_RFS=$(openssl rand -hex 64)
-        ```
-    - Generate corresponding key id (ID<sub>K_RFS</sub>):
-        ```
-        ID_K_RFS="keybroker/key/$(openssl rand -hex 32)"
-        ```
-
-        - Optionally, use the following command to check the uniqueness of the key id (ID<sub>K_RFS</sub>) in KMS.
-            ```
-            docker exec -e VAULT_ADDR="http://127.0.0.1:8200" -e VAULT_TOKEN="$VAULT_ROOT_TOKEN" trustee-vault \
-                vault kv get -mount=keybroker $ID_K_RFS
-            ```
-
-            The output `No value found at keybroker/<key-id>` indicates that the specified key id does not exist in the keybroker path and is therefore unused.
-            For any other result, generate another key id to prevent that an existing key is overwritten.
 
 10. [On Preparation Host] Send TD attributes from the TD Quote of TD<sub>W</sub>, the root filesystem encryption key (k<sub>RFS</sub>), and key id (ID<sub>K_RFS</sub>) to KBS:
     ```
@@ -659,40 +658,41 @@ Please adjust the commands according to your environment.
     ```
 
     In more detail, this script:
-    - extracts TD attributes `MRSEAM`, `MRSIGNERSEAM`, `SEAMSVN`, `MRTD`, `RTMR1`, `RTMR2`, and `RTMR3` from passed TD Quote,
+    - extracts TD attributes `MRSEAM`, `MRSIGNERSEAM`, `SEAMSVN`, `MRTD`, `RTMR0`, `RTMR1`, and `RTMR3` from passed TD Quote,
     - uses SK<sub>KBS</sub> key for administrator access to Trustee KBS,
     - based on the extracted TD attributes, generates an attestation policy for AS and a resource policy for KBS, which are later uses to validate key retrieval request,
     - sends the root filesystem encryption key (k<sub>RFS</sub>) and corresponding key id (ID<sub>K_RFS</sub>) to KBS, which stores the key k<sub>RFS</sub> in the KMS with id ID<sub>K_RFS</sub>.
 
-11. [On Preparation Host] Re-encrypt TD<sub>W</sub> with the root filesystem encryption key (k<sub>RFS</sub>), and enroll the TD boot mode `TD_FDE_BOOT`, the key id ID<sub>K_RFS</sub>, and the KBS URL into OVMF:
+11. [On Preparation Host] Re-encrypt TD<sub>W</sub> with the root filesystem encryption key (k<sub>RFS</sub>) and update GRUB configuration to boot in TD boot mode `TD_FDE_BOOT`:
     ```
     sudo tools/image/fde-encrypt_image.sh TD_FDE_BOOT \
         -p $PWD/tools/image/tdx-guest-ubuntu-24.04-encrypted.img \
         -e $PWD/tools/image/tdx-guest-ubuntu-24.04-encrypted.img \
         -d $PWD/data/tmp_k_rfs \
-        -u $KBS_URL \
-        -k $k_RFS \
-        -i $ID_K_RFS
+        -k $k_RFS
     ```
 
-    Script will print the updated OVMF file path and the updated encrypted image path.
+    In more detail, this script:
+    - re-encrypts the root filesystem partition using the generated root file system encryption key (k<sub>RFS</sub>), replacing the initial dummy key,
+    - changes the TD boot mode in the GRUB kernel command line,
+    - prints the path of the unchanged OVMF file and the path of the re-encrypted image.
 
     Example output:
     ```
     =============== Created Files ================
-    OVMF_PATH: <Path to updated OVMF file>
+    OVMF_PATH: <Path to OVMF file> (unchanged)
     IMAGE_PATH: <Path to encrypted image file>
     ```
 
 ## Runtime Phase
 
-1. [**On Workload Host**] Boot TD<sub>W</sub> combined with the OVMF image `OVMF_TD_FDE_BOOT.fd`.
+1. [**On Workload Host**] Boot TD<sub>W</sub> combined with the OVMF image `OVMF_FDE.fd`.
 
     Make sure the respective TD image and OVMF binaries are copied to Workload Host and the paths match the following command:
     ```
     TD_IMG=tools/image/tdx-guest-ubuntu-24.04-encrypted.img canonical-tdx/guest-tools/run_td.sh \
         -d false \
-        -f tools/image/OVMF_TD_FDE_BOOT.fd
+        -f tools/image/OVMF_FDE.fd
     ```
 
     During the TD boot, the FDE Agent in initramfs performs the following steps:
@@ -743,7 +743,7 @@ Please adjust the commands according to your environment.
 ## Limitations
 
 - The integrity of the actual workload is not protected.
-- The integrity of the components measured in RTMR0 are not protected.
+- The integrity of the components measured in RTMR2 are not protected.
 - Only QEMU-based boot using Canonical's `run_td.sh` is supported at the moment.
     This script does only support one TD at a time.
 - Trustee KBS and HashiCorp Vault (KMS) currently don't communicate over a secure channel.

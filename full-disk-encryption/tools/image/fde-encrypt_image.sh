@@ -16,12 +16,12 @@
 # - format_partitions: Formats the EFI, boot, and decrypted root partitions.
 # - fill_rootfs: Copies data from the base image to the root partition, mounts necessary partitions, and sets up the root filesystem.
 # - close_partitions: Closes the virtual device providing decrypted access to the root partition and detaches the loop device.
-# - modify_ovmf: Enrolls TD boot mode into the OVMF firmware.
+# - modify_ovmf: Enrolls KBS url and key ID corresponding to root filesystem encryption key into the OVMF firmware.
 #
 # TD_FDE_BOOT Boot Mode
 # - cleanup_td_fde_boot: Cleans up any remnants from a previous run, including unmounting partitions and disconnecting devices.
 # - reencrypt_luks_partition: Re-encrypts the existing LUKS partition with the provided key.
-# - modify_ovmf: Enrolls the TD boot mode, KBS URL, and root filesystem encryption key ID into the OVMF firmware.
+# - update_grub_config: Changes the TD boot mode in the GRUB kernel command line.
 
 MY_PATH="$(dirname "$(readlink -f "$0")")"
 pushd "${MY_PATH}"
@@ -153,15 +153,15 @@ Usage: $(basename "$0") <TD boot mode> [OPTION]...
 
 Boot modes:
     GET_QUOTE       Perform dummy encryption, which is used to retrieve TD quote from TD.
-    TD_FDE_BOOT     Perform encryption with provided key.
+    TD_FDE_BOOT     Perform encryption with provided key and update TD boot mode in GRUB configuration.
 
 Options:
     -c <KBS_CERT_PATH>      Path to TLS certificate of Trustee KBS; mandatory for TD boot mode \"GET_QUOTE\", forbidden for TD boot mode \"TD_FDE_BOOT\"
     -p <PATH_IMG_IN>        Path to the input image; mandatory for TD boot mode \"GET_QUOTE\" and \"TD_FDE_BOOT\"
     -e <PATH_IMG_OUT>       Path to the output image; optional for TD boot mode \"GET_QUOTE\" and \"TD_FDE_BOOT\"; default is \"GET_QUOTE\" added as a postfix for \"GET_QUOTE\" and \"TD_FDE_BOOT\" added as a postfix for \"TD_FDE_BOOT\".
-    -u <KBS_URL>            URL of Trustee KBS; mandatory for TD boot mode \"TD_FDE_BOOT\", forbidden for TD boot mode \"GET_QUOTE\"
+    -u <KBS_URL>            URL of Trustee KBS; mandatory for TD boot mode \"GET_QUOTE\", forbidden for TD boot mode \"TD_FDE_BOOT\"
     -k <K_RFS_HEX>          Key for encryption of root filesystem in hex encoding; mandatory for TD boot mode \"TD_FDE_BOOT\", forbidden for TD boot mode \"GET_QUOTE\"
-    -i <ID_K_RFS>           Key ID used by Trustee KBS for root filesystem encryption key; mandatory for TD boot mode \"TD_FDE_BOOT\", forbidden for TD boot mode \"GET_QUOTE\"
+    -i <ID_K_RFS>           Key ID used by Trustee KBS for root filesystem encryption key; mandatory for TD boot mode \"GET_QUOTE\", forbidden for TD boot mode \"TD_FDE_BOOT\"
     -d <TMP_K_RFS>          Path to store/read the dummy key used for encryption of root filesystem; mandatory for TD boot mode \"GET_QUOTE\" and \"TD_FDE_BOOT\"
 
     -r <SIZE_PART_ROOTFS>   Size of root filesystem partition; optional for TD boot mode \"GET_QUOTE\", forbidden for TD boot mode \"TD_FDE_BOOT\"; default is 10GB
@@ -286,8 +286,8 @@ function check_args_env() {
     fi
 
     if [[ $TD_BOOT_MODE == "GET_QUOTE" ]]; then
-        check_params_filled KBS_CERT_PATH
-        check_params_empty KBS_URL K_RFS_HEX ID_K_RFS
+        check_params_filled KBS_CERT_PATH KBS_URL ID_K_RFS
+        check_params_empty K_RFS_HEX
 
         if [ ! -f "$KBS_CERT_PATH" ]; then
             echo "Error: TLS certificate of Trustee KBS not found at provided path \"$KBS_CERT_PATH\"."
@@ -322,8 +322,8 @@ function check_args_env() {
         fi
 
     elif [[ "$TD_BOOT_MODE" == "TD_FDE_BOOT" ]]; then
-        check_params_filled KBS_URL K_RFS_HEX ID_K_RFS
-        check_params_empty KBS_CERT_PATH SIZE_PART_ROOTFS SIZE_PART_BOOT
+        check_params_filled K_RFS_HEX
+        check_params_empty KBS_CERT_PATH SIZE_PART_ROOTFS SIZE_PART_BOOT KBS_URL ID_K_RFS
 
         # Input image must be an raw image.
         if [[ "$PATH_IMG_IN" != *".img" ]]; then
@@ -366,9 +366,8 @@ function check_args_env() {
 function modify_ovmf() {
     local OVMF_INPUT=$1
     local OVMF_OUTPUT=$2
-    local TD_BOOT_MODE=$3
-    local KBS_URL=$4
-    local ID_K_RFS=$5
+    local KBS_URL=$3
+    local ID_K_RFS=$4
 
     # Create virtual environment for Python if it does not already exist
     if [ -e my_venv/bin/activate ]; then
@@ -385,33 +384,22 @@ function modify_ovmf() {
 
     rm -rf "${OVMF_OUTPUT}"
 
-    # Enroll TD boot mode to OVMF.
-    printf $TD_BOOT_MODE>td_boot_mode
-    VARIABLE_NAME="TDBOOTMODE"
-    VARIABLE_GUID="8093baf3-b42c-4a46-9c60-02888f011f03"
-    VARIABLE_VALUE_FILE_PATH="td_boot_mode"
+    # Enroll URL of KBS to OVMF.
+    printf $KBS_URL>kbs_url
+    VARIABLE_NAME="KBSURL"
+    VARIABLE_GUID="0d9b4a60-e0bf-4a66-b9b1-db1b98f87770"
+    VARIABLE_VALUE_FILE_PATH="kbs_url"
     python3 enroll_vars.py -i ${OVMF_INPUT} -o ${OVMF_OUTPUT} -n $VARIABLE_NAME -g $VARIABLE_GUID -d $VARIABLE_VALUE_FILE_PATH
 
-    if [[ $TD_BOOT_MODE == "TD_FDE_BOOT" ]]; then
-        # Enroll URL of KBS to OVMF.
-        printf $KBS_URL>kbs_url
-        VARIABLE_NAME="KBSURL"
-        VARIABLE_GUID="0d9b4a60-e0bf-4a66-b9b1-db1b98f87770"
-        VARIABLE_VALUE_FILE_PATH="kbs_url"
-        python3 enroll_vars.py -i ${OVMF_OUTPUT} -o ${OVMF_OUTPUT} -n $VARIABLE_NAME -g $VARIABLE_GUID -d $VARIABLE_VALUE_FILE_PATH
+    # Enroll id of root filesystem encryption key to OVMF.
+    printf "$ID_K_RFS">kbs_k_rfs_id
+    VARIABLE_NAME="KBSKRFSID"
+    VARIABLE_GUID="dc001d1f-60a1-4e1e-853e-42e9ab0e8b88"
+    VARIABLE_VALUE_FILE_PATH="kbs_k_rfs_id"
+    python3 enroll_vars.py -i ${OVMF_OUTPUT} -o ${OVMF_OUTPUT} -n $VARIABLE_NAME -g $VARIABLE_GUID -d $VARIABLE_VALUE_FILE_PATH
 
-        # Enroll id of root filesystem encryption key to OVMF.
-        printf "$ID_K_RFS">kbs_k_rfs_id
-        VARIABLE_NAME="KBSKRFSID"
-        VARIABLE_GUID="dc001d1f-60a1-4e1e-853e-42e9ab0e8b88"
-        VARIABLE_VALUE_FILE_PATH="kbs_k_rfs_id"
-        python3 enroll_vars.py -i ${OVMF_OUTPUT} -o ${OVMF_OUTPUT} -n $VARIABLE_NAME -g $VARIABLE_GUID -d $VARIABLE_VALUE_FILE_PATH
+    rm -rf kbs_url kbs_k_rfs_id
 
-        rm -rf kbs_url kbs_k_rfs_id
-    fi
-
-    # Cleanup
-    rm -rf td_boot_mode
     deactivate
 }
 
@@ -482,7 +470,7 @@ function create_luks_partition() {
     echo "/dev/mapper/${LABEL_DEV_DEC}"
 }
 
-# Function to re-encrypt the existing LUKS partition with the provided key.
+# Function to re-encrypt the existing LUKS partition with the provided key and update GRUB configuration in existing encrypted image..
 function reencrypt_luks_partition() {
     local key_new_hex=$1
     local PATH_IMG_OUT=$2
@@ -542,6 +530,88 @@ function reencrypt_luks_partition() {
     losetup -d $loop_dev
 }
 
+# Function to update GRUB configuration to change TD boot mode from GET_QUOTE to TD_FDE_BOOT
+# Parameters:
+#   - key_new_hex: New key for encryption of root filesystem in hex encoding.
+#   - PATH_IMG_OUT: Path to the output image.
+#   - label_dev_rootfs_dec: Label of virtual device that provides a decrypted view of the data in the encrypted partition.
+function update_grub_config() {
+    local key_new_hex=$1
+    local PATH_IMG_OUT=$2
+    local label_dev_rootfs_dec=$3
+
+    # Find an unused loop device and attach the image to it.
+    local loop_dev=$(losetup --find --show "$PATH_IMG_OUT")
+
+    # Inform the operating system kernel of partition table changes of the image file.
+    partprobe ${loop_dev}
+
+    # Determine the rootfs partition.
+    local part_rootfs=$(lsblk -lno NAME,PARTLABEL | grep 'rootfs' | awk '{print $1}' | tail -n 1)
+    part_rootfs="/dev/${part_rootfs}"
+
+    # Determine boot partitions
+    local part_boot=$(lsblk -lno NAME,PARTLABEL | grep -w 'boot' | awk '{print $1}' | tail -n 1)
+    part_boot="/dev/${part_boot}"
+
+    # Determine EFI partition.
+    local part_efi=$(lsblk -lno NAME,PARTLABEL | grep 'uefi' | awk '{print $1}' | tail -n 1)
+    part_efi="/dev/${part_efi}"
+
+    # Open the encrypted partition with the new key.
+    echo -n "$key_new_hex" | xxd -r -p |
+        cryptsetup luksOpen --key-size 512 $part_rootfs "${label_dev_rootfs_dec}" --key-file - || {
+        echo "Error: Failed to open LUKS partition with the new key, returned with status: $?."
+        cleanup_td_fde_boot "$PATH_IMG_OUT"
+        exit 1
+    }
+
+    # Create temporary directory and mount virtual device providing decrypted access to encrypted root partition to this directory.
+    mkdir -p ${PATH_MNT_ROOTFS}
+    mount "/dev/mapper/${label_dev_rootfs_dec}" ${PATH_MNT_ROOTFS}
+
+    # Mount the boot partition inside the "boot" folder of the root partition.
+    mkdir -p ${PATH_MNT_BOOT}
+    mount "$part_boot" ${PATH_MNT_BOOT}
+
+    # Mount the efi partition inside the "boot/efi" folder of the root partition.
+    mkdir -p ${PATH_MNT_EFI}
+    mount "$part_efi" ${PATH_MNT_EFI}
+
+    # Mount necessary system directories for chroot
+    mount -t proc none ${PATH_MNT_ROOTFS}/proc
+    mount -t sysfs none ${PATH_MNT_ROOTFS}/sys
+    mount --bind /dev ${PATH_MNT_ROOTFS}/dev
+    mount --bind /dev/pts ${PATH_MNT_ROOTFS}/dev/pts
+
+    # Update td-boot-mode in GRUB config
+    chroot ${PATH_MNT_ROOTFS} /bin/bash <<EOF
+set -e
+sed -i 's/td-boot-mode=GET_QUOTE/td-boot-mode=TD_FDE_BOOT/g' /etc/default/grub.d/50-cloudimg-settings.cfg
+cat /etc/default/grub.d/50-cloudimg-settings.cfg | grep GRUB_CMDLINE_LINUX_DEFAULT
+update-grub
+EOF
+
+    # Unmount everything
+    umount ${PATH_MNT_ROOTFS}/dev/pts
+    umount ${PATH_MNT_ROOTFS}/dev
+    umount ${PATH_MNT_ROOTFS}/sys
+    umount ${PATH_MNT_ROOTFS}/proc
+    umount ${PATH_MNT_EFI}
+    umount ${PATH_MNT_BOOT}
+    umount ${PATH_MNT_ROOTFS}
+
+    # Close virtual device providing decrypted access to root partition.
+    cryptsetup close "$label_dev_rootfs_dec" || {
+        echo "Error: Failed to close virtual device providing decrypted access to root partition, returned with status: $?."
+        cleanup_td_fde_boot "$PATH_IMG_OUT"
+        exit 1
+    }
+
+    # Detach loop device.
+    losetup -d $loop_dev
+}
+
 # Format EFI partition, boot partition, and device providing decrypted access to encrypted root partition.
 # Parameters:
 #   - PART_EFI: EFI partition that should be formatted.
@@ -580,6 +650,7 @@ function fill_rootfs() {
     local KBS_CERT_PATH=$6
     local LABEL_PART_ROOTFS_ENC=$7
     local LABEL_DEV_ROOTFS_DEC=$8
+    local TD_BOOT_MODE=$9
 
     # Ensures that the nbd module is available
     if ! lsmod | grep -wq nbd; then
@@ -669,7 +740,7 @@ function fill_rootfs() {
 
     # Copy installation script into root partition, execute it, and remove it.
     cp scripts/install ${PATH_MNT_ROOTFS}/tmp/
-    chroot ${PATH_MNT_ROOTFS}/ /bin/bash tmp/install $PART_ROOTFS $LABEL_PART_ROOTFS_ENC $LABEL_DEV_ROOTFS_DEC
+    chroot ${PATH_MNT_ROOTFS}/ /bin/bash tmp/install "$PART_ROOTFS" "$LABEL_PART_ROOTFS_ENC" "$LABEL_DEV_ROOTFS_DEC" "$TD_BOOT_MODE"
     rm ${PATH_MNT_ROOTFS}/tmp/install
 
     # Clean up mount points
@@ -756,7 +827,7 @@ function handle_get_quote() {
     echo "=============== Fill Opened RootFS ========"
 
     # Fill RootFS with needed files
-    fill_rootfs "$PART_EFI" "$PART_BOOT" "$DEV_ROOTFS_DEC" "$PART_ROOTFS" "$PATH_IMG_IN" "$KBS_CERT_PATH" "$LABEL_PART_ROOTFS_ENC" "$LABEL_DEV_ROOTFS_DEC"
+    fill_rootfs "$PART_EFI" "$PART_BOOT" "$DEV_ROOTFS_DEC" "$PART_ROOTFS" "$PATH_IMG_IN" "$KBS_CERT_PATH" "$LABEL_PART_ROOTFS_ENC" "$LABEL_DEV_ROOTFS_DEC" "$TD_BOOT_MODE"
 
     echo "=============== Close Partitions ============="
 
@@ -766,19 +837,14 @@ function handle_get_quote() {
     echo "=============== Enroll Variables into OVMF ============="
 
     # Enroll variables in OVMF
-    modify_ovmf "$OVMF_INPUT" "$OVMF_OUTPUT" "$TD_BOOT_MODE" "$KBS_URL" "$ID_K_RFS"
+    modify_ovmf "$OVMF_INPUT" "$OVMF_OUTPUT" "$KBS_URL" "$ID_K_RFS"
 }
 
 # Function to handle the TD_FDE_BOOT boot mode
 function handle_td_fde_boot() {
-    local OVMF_INPUT=$1
-    local OVMF_OUTPUT=$2
-    local PATH_IMG_OUT=$3
-    local KBS_URL=$4
-    local K_RFS_HEX=$5
-    local ID_K_RFS=$6
-    local TD_BOOT_MODE=$7
-    local TMP_K_RFS=$8
+    local PATH_IMG_OUT=$1
+    local K_RFS_HEX=$2
+    local TMP_K_RFS=$3
 
     echo "=============== Cleanup Last Run ==============="
 
@@ -789,10 +855,10 @@ function handle_td_fde_boot() {
     # Re-encrypt the existing LUKS partition with the provided key.
     reencrypt_luks_partition "$K_RFS_HEX" "$PATH_IMG_OUT" "$LABEL_DEV_ROOTFS_DEC" "$TMP_K_RFS"
 
-    echo "=============== Enroll Variables into OVMF ============="
+    echo "=============== Update GRUB Configuration ==============="
 
-    # Enroll variables in OVMF
-    modify_ovmf "$OVMF_INPUT" "$OVMF_OUTPUT" "$TD_BOOT_MODE" "$KBS_URL" "$ID_K_RFS"
+    # Update GRUB configuration to change TD boot mode from GET_QUOTE to TD_FDE_BOOT
+    update_grub_config "$K_RFS_HEX" "$PATH_IMG_OUT" "$LABEL_DEV_ROOTFS_DEC"
 }
 
 # Function to perform cleanup when script is interrupted
@@ -820,7 +886,7 @@ echo "=============== Check Validity of Parameters ==============="
 OVMF_INPUT=${MY_PATH}/../../data/ovmf-extracted/usr/share/ovmf/OVMF.tdx.fd
 # Output OVMF file with enrolled variables.
 # It will be created in the current directory.
-OVMF_OUTPUT=OVMF_${TD_BOOT_MODE}.fd
+OVMF_OUTPUT=OVMF_FDE.fd
 
 # Check validity of provided arguments and environment variables.
 check_args_env
@@ -832,7 +898,7 @@ trap cleanup_on_interrupt SIGINT SIGTERM
 if [[ $TD_BOOT_MODE == "GET_QUOTE" ]]; then
     handle_get_quote "$OVMF_INPUT" "$OVMF_OUTPUT" "$PATH_IMG_IN" "$PATH_IMG_OUT" "$KBS_URL" "$KBS_CERT_PATH" "$TMP_K_RFS" "$ID_K_RFS" "$TD_BOOT_MODE"
 elif [[ $TD_BOOT_MODE == "TD_FDE_BOOT" ]]; then
-    handle_td_fde_boot "$OVMF_INPUT" "$OVMF_OUTPUT" "$PATH_IMG_OUT" "$KBS_URL" "$K_RFS_HEX" "$ID_K_RFS" "$TD_BOOT_MODE" "$TMP_K_RFS"
+    handle_td_fde_boot "$PATH_IMG_OUT" "$K_RFS_HEX" "$TMP_K_RFS"
 else
     echo "Invalid TD boot mode '$TD_BOOT_MODE'"
     usage
@@ -846,7 +912,11 @@ chown $LOGIN_USER:$USER_GROUP $PATH_IMG_OUT
 
 # Output full paths of the created files
 echo "=============== Created Files ================"
-echo "OVMF_PATH: $(realpath $OVMF_OUTPUT)"
+if [[ "$TD_BOOT_MODE" == "GET_QUOTE" ]]; then
+    echo "OVMF_PATH: $(realpath $OVMF_OUTPUT)"
+elif [[ "$TD_BOOT_MODE" == "TD_FDE_BOOT" ]]; then
+    echo "OVMF_PATH: $(realpath $OVMF_OUTPUT) (unchanged)"
+fi
 echo "IMAGE_PATH: $(realpath $PATH_IMG_OUT)"
 
 echo "=============== Build End ================"

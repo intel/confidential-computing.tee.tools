@@ -53,6 +53,9 @@ for x in $CMDLINE; do
         LABEL_DEV_ROOTFS_DEC=$2
         IFS=$oldIFS
         ;;
+    td-boot-mode=*)
+        TD_BOOT_MODE=${x#td-boot-mode=}
+        ;;
     esac
 done
 
@@ -82,7 +85,7 @@ fi
 echo "port=4050" >/etc/tdx-attest.conf
 
 # Call image FDE decryption script.
-fde_decrypt_image_params="--label-part-rootfs-enc ${LABEL_PART_ROOTFS_ENC} --label-dev-rootfs-dec ${LABEL_DEV_ROOTFS_DEC}"
+fde_decrypt_image_params="--label-part-rootfs-enc ${LABEL_PART_ROOTFS_ENC} --label-dev-rootfs-dec ${LABEL_DEV_ROOTFS_DEC} --td-boot-mode ${TD_BOOT_MODE}"
 log_begin_msg "Calling fde-decrypt-image script with parameters \"${fde_decrypt_image_params}\""
 /sbin/fde-decrypt-image ${fde_decrypt_image_params} || panic "Abort execution"
 

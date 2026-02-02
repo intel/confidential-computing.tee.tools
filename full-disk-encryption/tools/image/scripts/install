@@ -6,6 +6,7 @@
 PART_ROOT=$1
 LABEL_PART_ROOTFS_ENC=$2
 LABEL_DEV_ROOTFS_DEC=$3
+TD_BOOT_MODE=$4
 
 set -e
 
@@ -18,8 +19,8 @@ apt update && apt install --yes --allow-downgrades shim-signed grub-efi-amd64-si
 grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=ubuntu
 
 # Configure kernel command line.
-cryptdevice_cmdline="cryptdevice=UUID=$(blkid -o value -s UUID $PART_ROOT):${LABEL_DEV_ROOTFS_DEC}"
-sed -i "s|\(^GRUB_CMDLINE_LINUX_DEFAULT=\"\)\(.*\)|\1${cryptdevice_cmdline} \2|" \
+kernel_cmdline="cryptdevice=UUID=$(blkid -o value -s UUID $PART_ROOT):${LABEL_DEV_ROOTFS_DEC} td-boot-mode=${TD_BOOT_MODE}"
+sed -i "s|\(^GRUB_CMDLINE_LINUX_DEFAULT=\"\)\(.*\)|\1${kernel_cmdline} \2|" \
     /etc/default/grub.d/50-cloudimg-settings.cfg
 
 echo "CMDLINE: $CMDLINE"

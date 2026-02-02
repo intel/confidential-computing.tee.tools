@@ -8,49 +8,11 @@ use std::str::FromStr;
 
 const KBS_URL_GUID: &str = "KBSURL-0d9b4a60-e0bf-4a66-b9b1-db1b98f87770";
 const KBS_K_RFS_ID_GUID: &str = "KBSKRFSID-dc001d1f-60a1-4e1e-853e-42e9ab0e8b88";
-const TDBOOTMODE_GUID: &str = "TDBOOTMODE-8093baf3-b42c-4a46-9c60-02888f011f03";
-
-#[derive(Debug)]
-pub struct OvmfParamsBootMode {
-    pub mode: String,
-}
 
 #[derive(Debug)]
 pub struct OvmfParamsFdeBoot {
     pub kbs_url: Vec<u8>,
     pub kbs_k_rfs_id: Vec<u8>,
-}
-
-impl OvmfParamsBootMode {
-    /// Retrieves parameters from OVMF (Open Virtual Machine Firmware).
-    ///
-    /// # Parameters
-    ///
-    /// - `td_boot_mode`: A string representing the TD boot mode.
-    ///
-    /// # Errors
-    ///
-    /// This function will return an error if it fails to read the UEFI variables.
-    ///
-    /// # Panics
-    ///
-    /// This function will panic if it fails to create a `Variable` from the provided GUID strings.
-    pub fn new() -> Result<Self> {
-        let var_manager = system();
-
-        // Read TD boot mode from OVMF.
-        let td_boot_mode_variable =
-            Variable::from_str(TDBOOTMODE_GUID).expect("Failed to create variable for TD boot mode");
-        let (td_boot_mode_bytes, _td_boot_mode_flags) = var_manager
-            .read(&td_boot_mode_variable)
-            .expect("Failed to read TD boot mode");
-        let td_boot_mode =
-            String::from_utf8(td_boot_mode_bytes).expect("Failed to convert TD boot mode to string");
-
-        Ok(Self {
-            mode: td_boot_mode,
-        })
-    }
 }
 
 impl OvmfParamsFdeBoot {

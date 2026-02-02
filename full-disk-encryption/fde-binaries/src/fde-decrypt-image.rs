@@ -7,7 +7,7 @@ use clap::Parser;
 use zeroize::Zeroizing;
 use utils::{
     key_broker_client::{KBSClient, TrusteeKbsClient},
-    ovmf_var::{OvmfParamsBootMode, OvmfParamsFdeBoot},
+    ovmf_var::{OvmfParamsFdeBoot},
     quote::*,
     disk::crypt_setup,
 };
@@ -21,6 +21,10 @@ struct Args {
     // Label of device providing decrypted access to encrypted root partition.
     #[arg(long)]
     label_dev_rootfs_dec: String,
+
+    // TD boot mode (GET_QUOTE or TD_FDE_BOOT).
+    #[arg(long)]
+    td_boot_mode: String,
 }
 
 #[tokio::main(worker_threads = 1)]
@@ -29,13 +33,11 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let label_part_rootfs_enc = args.label_part_rootfs_enc;
     let label_dev_rootfs_dec: String = args.label_dev_rootfs_dec;
+    let td_boot_mode: String = args.td_boot_mode;
 
     // Print input arguments.
     println!("Label Partition Rootfs Enc: {}", label_part_rootfs_enc);
     println!("Label Device Rootfs Dec: {}", label_dev_rootfs_dec);
-
-    // Extract TD boot mode from OVMF parameters and print it.
-    let td_boot_mode = OvmfParamsBootMode::new()?.mode;
     println!("TD Boot Mode: {}", td_boot_mode);
 
     // Check if TD boot mode is either GET_QUOTE or TD_FDE_BOOT.
