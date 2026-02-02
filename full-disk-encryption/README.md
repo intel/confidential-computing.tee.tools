@@ -519,8 +519,6 @@ Please adjust the commands according to your environment.
     ID_K_RFS="keybroker/key/$(openssl rand -hex 32)"
     ```
 
-    > NOTE: We first do the encryption with a dummy key, but we already have to enroll the final key ID into the OVMF image used for the dummy encryption.
-
     - Optionally, use the following command to check the uniqueness of the key id (ID<sub>K_RFS</sub>) in KMS.
         ```
         docker exec -e VAULT_ADDR="http://127.0.0.1:8200" -e VAULT_TOKEN="$VAULT_ROOT_TOKEN" trustee-vault \
@@ -530,7 +528,7 @@ Please adjust the commands according to your environment.
         The output `No value found at keybroker/<key-id>` indicates that the specified key id does not exist in the keybroker path and is therefore unused.
         For any other result, generate another key id to prevent that an existing key is overwritten.
 
-5. [On Preparation Host] Create TD image TD<sub>W</sub> with workload, a dummy key used for FDE:
+5. [On Preparation Host] Create TD image TD<sub>W</sub> with workload and encrypt with root filesystem encryption key (k<sub>RFS</sub>):
     - Activate automatic attestation packages installation inside of the image:
         ```
         sed -i "s/^TDX_SETUP_ATTESTATION=0$/TDX_SETUP_ATTESTATION=1/" canonical-tdx/setup-tdx-config
@@ -556,49 +554,42 @@ Please adjust the commands according to your environment.
         ```
         mkdir data
         ```
-
-    - Create dummy key used for initial FDE:
-        ```
-        openssl rand -hex 64 > data/tmp_k_rfs
-        ```
-
     - Download and extracts OVMF:
         ```
         wget https://launchpad.net/~kobuk-team/+archive/ubuntu/tdx-release/+files/ovmf_2024.02-3+tdx1.0_all.deb -P data/
         dpkg-deb -x data/ovmf_*.deb data/ovmf-extracted
         ```
 
-    - Using the (enriched) base image TD<sub>B</sub>, create a dummy TD image TD<sub>W</sub> that is used to retrieve a TD Quote:
+    - Using the (enriched) base image TD<sub>B</sub>, create an encrypted TD image TD<sub>W</sub> that is used to retrieve a TD Quote:
         ```
         sudo tools/image/fde-encrypt_image.sh GET_QUOTE \
             -p $PWD/canonical-tdx/guest-tools/image/tdx-guest-ubuntu-24.04-generic.qcow2 \
             -e $PWD/tools/image/tdx-guest-ubuntu-24.04-encrypted.img \
-            -d $PWD/data/tmp_k_rfs \
+            -k $k_RFS \
             -c $KBS_CERT_PATH \
             -i $ID_K_RFS \
             -u $KBS_URL
         ```
 
-        > NOTE: The dummy TD image TD<sub>W</sub> requires enough disk space for the following pieces: (1) space for data from the (enriched) base image TD<sub>B</sub>, (2) space for data generated at runtime, and (3) space for encryption overhead of approximately 1GB.
+        > NOTE: The TD image TD<sub>W</sub> requires enough disk space for the following pieces: (1) space for data from the (enriched) base image TD<sub>B</sub>, (2) space for data generated at runtime, and (3) space for encryption overhead of approximately 1GB.
         > By default, we allocate 10GB for the root filesystem partition, 2GB for the boot partition, and 101MB for BIOS/EFI resulting in of total image size of approximately 12GB.
         > The size of the root filesystem and boot partitions can be adjusted via command line attributes during the `fde-encrypt_image.sh` invocation.
         > See `sudo tools/image/fde-encrypt_image.sh -h` for more details.
 
         In more detail, this script:
         - creates a completely new TD image with multiple partitions,
-        - creates a LUKS2 encrypted partition using the provided dummy key,
+        - creates a LUKS2 encrypted partition using provided root filesystem encryption key (k<sub>RFS</sub>),
         - formats the partitions,
         - fills the encrypted partition with data from the base image TD<sub>B</sub> and FDE binaries,
-        - enrolls the KBS URL and the key ID (ID<sub>K_RFS</sub>) corresponding to root filesystem encryption key (k<sub>RFS</sub>) into an OVMF image.
+        - enrolls the KBS URL and the key ID (ID<sub>K_RFS</sub>) corresponding to root filesystem encryption key (k<sub>RFS</sub>) into an OVMF image,
+        - prints the path of the resulting OVMF file and encrypted image.
 
-        In a later step, the dummy key for the LUKS2 partition is replaced by actual key.
-
-        Script will print the updated OVMF file path and the updated encrypted image path.
+        Script will print the updated OVMF image path and the encrypted image path.
 
         Example output:
         ```
         =============== Created Files ================
-        OVMF_PATH: <Path to updated OVMF file>
+        OVMF_PATH: <Path to updated OVMF image file>
         IMAGE_PATH: <Path to encrypted image file>
         ```
 
@@ -663,24 +654,22 @@ Please adjust the commands according to your environment.
     - based on the extracted TD attributes, generates an attestation policy for AS and a resource policy for KBS, which are later uses to validate key retrieval request,
     - sends the root filesystem encryption key (k<sub>RFS</sub>) and corresponding key id (ID<sub>K_RFS</sub>) to KBS, which stores the key k<sub>RFS</sub> in the KMS with id ID<sub>K_RFS</sub>.
 
-11. [On Preparation Host] Re-encrypt TD<sub>W</sub> with the root filesystem encryption key (k<sub>RFS</sub>) and update GRUB configuration to boot in TD boot mode `TD_FDE_BOOT`:
+11. [On Preparation Host] Update GRUB configuration to boot in TD boot mode `TD_FDE_BOOT`:
     ```
     sudo tools/image/fde-encrypt_image.sh TD_FDE_BOOT \
         -p $PWD/tools/image/tdx-guest-ubuntu-24.04-encrypted.img \
         -e $PWD/tools/image/tdx-guest-ubuntu-24.04-encrypted.img \
-        -d $PWD/data/tmp_k_rfs \
         -k $k_RFS
     ```
 
     In more detail, this script:
-    - re-encrypts the root filesystem partition using the generated root file system encryption key (k<sub>RFS</sub>), replacing the initial dummy key,
     - changes the TD boot mode in the GRUB kernel command line,
-    - prints the path of the unchanged OVMF file and the path of the re-encrypted image.
+    - prints the path of the unchanged OVMF file and the path of the adjusted image.
 
     Example output:
     ```
     =============== Created Files ================
-    OVMF_PATH: <Path to OVMF file> (unchanged)
+    OVMF_PATH: <Path to OVMF image file> (unchanged)
     IMAGE_PATH: <Path to encrypted image file>
     ```
 
