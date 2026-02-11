@@ -60,12 +60,15 @@ for x in $CMDLINE; do
 done
 
 # Check if UUID of of encrypted root filesystem was provided.
-# If this is the case, use resolve_device function, which is defined in /scripts/functions, to covert passed UUID of encrypted root filesystem to corresponding device name.
+# If this is the case, use resolve_device function, which is defined in /scripts/functions, to convert passed UUID of encrypted root filesystem to corresponding device name.
 # resolve_device writes the result to a variable named DEV.
 # Finally convert device name of encrypted root filesystem to input parameter expected by fde-decrypt-image.
 # Otherwise, panic.
 if [ -n "${UUID_PART_ROOTFS}" ]; then
     resolve_device "${UUID_PART_ROOTFS}"
+    if [ $? -ne 0 ]; then
+        panic "Provided UUID of root filesystem is invalid"
+    fi
     LABEL_PART_ROOTFS_ENC="${DEV}"
 else
     panic "UUID of root filesystem not provided"
@@ -73,7 +76,15 @@ fi
 
 # Check if labels for virtual device providing decrypted access to encrypted root partition was provided.
 if [ -z "${LABEL_DEV_ROOTFS_DEC}" ]; then
-    panic "UUID of root filesystem not provided"
+    panic "Label of decrypted root filesystem device not provided"
+fi
+
+# Verify LUKS label matches expected value
+ACTUAL_LABEL=$(blkid -s LABEL -o value "${LABEL_PART_ROOTFS_ENC}" 2>/dev/null)
+EXPECTED_LABEL=$(echo "${ACTUAL_LABEL}" | sed 's/rootfs-enc_/rootfs-enc-dev_/')
+
+if [ "${EXPECTED_LABEL}" != "${LABEL_DEV_ROOTFS_DEC}" ]; then
+    panic "LUKS label mismatch! Expected '${EXPECTED_LABEL}', but label '${LABEL_DEV_ROOTFS_DEC}' is provided"
 fi
 
 # Check if fde-decrypt-image script is present and executable.

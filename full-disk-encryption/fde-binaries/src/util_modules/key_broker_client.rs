@@ -45,6 +45,8 @@ struct TrusteeResourcePolicy {
     rtmr0: String,
     /// Runtime measurement register 1
     rtmr1: String,
+    /// Runtime measurement register 2
+    rtmr2: String,
     /// Runtime measurement register 3
     rtmr3: String,
 }
@@ -110,6 +112,7 @@ impl TrusteeKbsClient {
 
                     input["submods"]["cpu0"]["ear.veraison.annotated-evidence"]["tdx"]["quote"]["body"]["rtmr_0"] == "{}"
                     input["submods"]["cpu0"]["ear.veraison.annotated-evidence"]["tdx"]["quote"]["body"]["rtmr_1"] == "{}"
+                    input["submods"]["cpu0"]["ear.veraison.annotated-evidence"]["tdx"]["quote"]["body"]["rtmr_2"] == "{}"
                     input["submods"]["cpu0"]["ear.veraison.annotated-evidence"]["tdx"]["quote"]["body"]["rtmr_3"] == "{}"
                     input["submods"]["cpu0"]["ear.veraison.annotated-evidence"]["tdx"]["quote"]["body"]["mr_seam"] == "{}"
                     input["submods"]["cpu0"]["ear.veraison.annotated-evidence"]["tdx"]["quote"]["body"]["mrsigner_seam"] == "{}"
@@ -120,6 +123,7 @@ impl TrusteeKbsClient {
             key_id,
             params.rtmr0,
             params.rtmr1,
+            params.rtmr2,
             params.rtmr3,
             params.mrseam,
             params.mrsignerseam,
@@ -362,28 +366,18 @@ impl KBSClient for TrusteeKbsClient {
     ///
     /// * `Result<()>` - A result indicating success or failure.
     fn store_k_rfs(&self, k_rfs: &str, sk_kbs_admin: &str, quote: &Quote, k_rfs_id: &str) -> Result<()> {
-        // Extract values from the Quote object
-        let (mrseam, mrsignerseam, seamsvn, mrtd, rtmr0, rtmr1, rtmr3) = match quote {
-            Quote::V4(q) => (
-                hex::encode(q.report_body.mr_seam.m),
-                hex::encode(q.report_body.mrsigner_seam.m),
-                q.get_intel_tdx_module_version(),
-                hex::encode(q.report_body.mr_td.m),
-                hex::encode(q.report_body.rt_mr[0].m),
-                hex::encode(q.report_body.rt_mr[1].m),
-                hex::encode(q.report_body.rt_mr[3].m),
-            ),
-        };
-
-        // Construct parameters to set resource policy.
-        let trustee_resource_policy = TrusteeResourcePolicy {
-            mrseam,
-            mrsignerseam,
-            seamsvn,
-            mrtd,
-            rtmr0,
-            rtmr1,
-            rtmr3,
+        // Extract values from the Quote object and construct parameters to set resource policy.
+        let trustee_resource_policy = match quote {
+            Quote::V4(q) => TrusteeResourcePolicy {
+                mrseam: hex::encode(q.report_body.mr_seam.m),
+                mrsignerseam: hex::encode(q.report_body.mrsigner_seam.m),
+                seamsvn: q.get_intel_tdx_module_version(),
+                mrtd: hex::encode(q.report_body.mr_td.m),
+                rtmr0: hex::encode(q.report_body.rt_mr[0].m),
+                rtmr1: hex::encode(q.report_body.rt_mr[1].m),
+                rtmr2: hex::encode(q.report_body.rt_mr[2].m),
+                rtmr3: hex::encode(q.report_body.rt_mr[3].m),
+            },
         };
 
         // Create a resource policy for Trustee KBS.

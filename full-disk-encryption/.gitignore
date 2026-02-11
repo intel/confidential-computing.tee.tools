@@ -7,5 +7,8 @@ tools/image/*.tar.xz
 tools/image/*.img
 tools/image/my_venv
 tools/image/kbs_url
+tools/image/initrd.*
+tools/image/vmlinuz*
 tools/image/tmp_fde/
 setup_config.sh
+tools/image/td_boot_params.sh

@@ -75,7 +75,7 @@ The first three steps are rather self-describing and we refer for later sections
 The fourth step is elaborate in itself and we want to present a few details here.
 The goal of this task is to prepare a UEFI firmware (e.g., OVMF or TDVF) and a TD image.
 The UEFI firmware must be enabled for Intel TDX and its integrity is protected by remote attestation.
-The TD image contains a bootloader, a Linux kernel, initramfs with an "FDE Agent", and a root filesystem partition with the OS and workload.
+The TD image contains a Linux kernel, initramfs with an "FDE Agent", and a root filesystem partition with the OS and workload.
 The Workload Owner generates a key, encrypts the root filesystem with this key using LUKS2, and stores the key in the KMS.
 All other pieces of the TD image are integrity protected by remote attestation.
 
@@ -103,6 +103,8 @@ On a high level, the following is done during the runtime phase, which is also v
 
 For this detailed recipe of our solution, we assume that [HashiCorp Vault](https://www.hashicorp.com/de/products/vault) is used as KMS, [Trustee's Attestation Service](https://github.com/confidential-containers/trustee/tree/v0.15.0/attestation-service) is used as Attestation Service (AS), and [Trustee's Key Broker Service](https://github.com/confidential-containers/trustee/tree/v0.15.0/kbs) is used as Key Broker Service (KBS).
 As mentioned before, we do not make any assumption where exactly all the individual components are deployed - the components might run on the same physical machine, some components might be co-located, or each might be on a separate machine.
+This recipe uses QEMU direct boot, which bypasses SHIM and GRUB in the boot chain by providing the kernel and initrd directly to QEMU.
+This approach simplifies the boot process and reduces the attack surface.
 
 For ease of explanation in this recipe, **we assume that all components are deployed on the same physical machine**.
 Please adjust the commands according to your environment.
@@ -114,9 +116,9 @@ Please adjust the commands according to your environment.
 
 #### Setup Workload Host
 
-1. Verify that supported hardware is used following the [Supported Hardware section](https://github.com/canonical/tdx/tree/3.1?tab=readme-ov-file#3-supported-hardware) of Canonical's guide.
-2. Setup the host OS and BIOS settings following the [Setup Host OS section](https://github.com/canonical/tdx/tree/3.1?tab=readme-ov-file#4-setup-host-os) of Canonical's guide.
-3. Setup remote attestation and register your platform according to the [Setup Intel® SGX Data Center Attestation Primitives (Intel® SGX DCAP) on the Host OS section](https://github.com/canonical/tdx/tree/3.1?tab=readme-ov-file#82-setup-intel-sgx-data-center-attestation-primitives-intel-sgx-dcap-on-the-host-os) of Canonical's guide.
+1. Verify that supported hardware is used following the [Supported Hardware section](https://github.com/canonical/tdx/tree/3.3?tab=readme-ov-file#3-supported-hardware) of Canonical's guide.
+2. Setup the host OS and BIOS settings following the [Setup Host OS section](https://github.com/canonical/tdx/tree/3.3?tab=readme-ov-file#4-setup-host-os) of Canonical's guide.
+3. Setup remote attestation and register your platform according to the [Setup Intel® SGX Data Center Attestation Primitives (Intel® SGX DCAP) on the Host OS section](https://github.com/canonical/tdx/tree/3.3?tab=readme-ov-file#92-setup-intel-sgx-data-center-attestation-primitives-intel-sgx-dcap-on-the-host-os) of Canonical's guide.
 
 #### Prerequisites for KMS, AS, and KBS
 
@@ -140,7 +142,7 @@ Please adjust the commands according to your environment.
     pushd fde/full-disk-encryption/
     ```
 
-    > NOTE: This will also clone Trustee's repository with tag `v0.15.0` and Canonical's Intel TDX repository with tag `3.1` inside `full-disk-encryption` directory.
+    > NOTE: This will also clone Trustee's repository with tag `v0.15.0` and Canonical's Intel TDX repository with tag `3.3` inside `full-disk-encryption` directory.
 
 4. Create configuration directory for Trustee's AS and KBS:
     ```
@@ -501,7 +503,7 @@ Please adjust the commands according to your environment.
     pushd fde/full-disk-encryption/
     ```
 
-    > NOTE: This will also clone Trustee's repository with tag `v0.15.0` and Canonical's Intel TDX repository with tag `3.1` inside `full-disk-encryption` directory.
+    > NOTE: This will also clone Trustee's repository with tag `v0.15.0` and Canonical's Intel TDX repository with tag `3.3` inside `full-disk-encryption` directory.
 
 3. [On Preparation Host] Build FDE Binaries:
     ```
@@ -562,7 +564,7 @@ Please adjust the commands according to your environment.
 
     - Using the (enriched) base image TD<sub>B</sub>, create an encrypted TD image TD<sub>W</sub> that is used to retrieve a TD Quote:
         ```
-        sudo tools/image/fde-encrypt_image.sh GET_QUOTE \
+        sudo tools/image/fde-encrypt_image.sh \
             -p $PWD/canonical-tdx/guest-tools/image/tdx-guest-ubuntu-24.04-generic.qcow2 \
             -e $PWD/tools/image/tdx-guest-ubuntu-24.04-encrypted.img \
             -k $k_RFS \
@@ -582,15 +584,20 @@ Please adjust the commands according to your environment.
         - formats the partitions,
         - fills the encrypted partition with data from the base image TD<sub>B</sub> and FDE binaries,
         - enrolls the KBS URL and the key ID (ID<sub>K_RFS</sub>) corresponding to root filesystem encryption key (k<sub>RFS</sub>) into an OVMF image,
-        - prints the path of the resulting OVMF file and encrypted image.
-
-        Script will print the updated OVMF image path and the encrypted image path.
+        - extracts the kernel binary and initrd from the encrypted image,
+        - stores all output files (i.e., encrypted image, kernel binary, and initrd) in the same directory as the output image path specified with `-e` parameter, ensuring all files are kept together,
+        - prints the path of the resulting OVMF image, encrypted TD image, initrd, kernel, and a TD boot parameters file, which contains all the aforementioned paths.
 
         Example output:
         ```
-        =============== Created Files ================
+        =============== Important Boot Related Files ================
         OVMF_PATH: <Path to updated OVMF image file>
-        IMAGE_PATH: <Path to encrypted image file>
+        TD_IMAGE_PATH: <Path to encrypted image file>
+        INITRD_PATH: <Path to initrd file>
+        KERNEL_IMAGE: <Path to kernel image file>
+
+        Please find the above paths in TD Boot Params file:
+        TD_BOOT_PARAMS: <Path to TD boot parameters file>
         ```
 
 6. [**On Workload Host**] Download FDE solution and move into its directory:
@@ -599,21 +606,27 @@ Please adjust the commands according to your environment.
     pushd fde/full-disk-encryption/
     ```
 
-    > NOTE: This will also clone Trustee's repository with tag `v0.15.0` and Canonical's Intel TDX repository with tag `3.1` inside `full-disk-encryption` directory.
+    > NOTE: This will also clone Trustee's repository with tag `v0.15.0` and Canonical's Intel TDX repository with tag `3.3` inside `full-disk-encryption` directory.
 
-7. [On Workload Host] Patch the TD launch script:
-    ```
-    git -C canonical-tdx apply ../patches/run_td_sh.patch
-    ```
+7. [On Workload Host] Boot TD<sub>W</sub> combined with the OVMF image, the kernel image, initrd.
+    Make sure the TD image, OVMF image, kernel image, initrd and TD boot parameters file are copied to Workload Host.
 
-8. [On Workload Host] Boot TD<sub>W</sub> combined with the OVMF image `OVMF_FDE.fd`.
-    Make sure the respective TD image and OVMF binaries are copied to Workload Host and the paths match the following command:
-    ```
-    TD_IMG=tools/image/tdx-guest-ubuntu-24.04-encrypted.img \
-        canonical-tdx/guest-tools/run_td.sh \
-        -d false \
-        -f tools/image/OVMF_FDE.fd
-    ```
+    - If needed, adjust the paths in the TD boot parameters file and load the values to environment parameters:
+        ```
+        source tools/image/td_boot_params.sh
+        ```
+
+    - Boot the TD:
+        ```
+        ./boot_td.sh \
+            -o $OVMF_PATH \
+            -t $TD_IMAGE_PATH \
+            -i $INITRD_PATH \
+            -k $KERNEL_PATH \
+            -u $UUID_PART_ROOTFS \
+            -l $LABEL_DEV_ROOTFS_DEC \
+            -m GET_QUOTE
+        ```
 
     During boot, FDE Agent retrieves a TD Quote, prints the TD Quote in an export command, and stops further boot.
     Example output:
@@ -632,12 +645,12 @@ Please adjust the commands according to your environment.
     > NOTE: "panic=1" is used by the FDE Agent to kill the TD on every error.
     > This is an important security feature for production systems, but you might want to remove it during debug sessions.
 
-9. [**On Preparation Host**] Export TD Quote returned by last command:
+8. [**On Preparation Host**] Export TD Quote returned by last command:
     ```
     export QUOTE=<base64 encoded TD quote>
     ```
 
-10. [On Preparation Host] Send TD attributes from the TD Quote of TD<sub>W</sub>, the root filesystem encryption key (k<sub>RFS</sub>), and key id (ID<sub>K_RFS</sub>) to KBS:
+9. [On Preparation Host] Send TD attributes from the TD Quote of TD<sub>W</sub>, the root filesystem encryption key (k<sub>RFS</sub>), and key id (ID<sub>K_RFS</sub>) to KBS:
     ```
     ./fde-binaries/target/release/fde-kbs-store-key \
         --sk-kbs-admin-path $SK_KBS_ADMIN \
@@ -649,40 +662,32 @@ Please adjust the commands according to your environment.
     ```
 
     In more detail, this script:
-    - extracts TD attributes `MRSEAM`, `MRSIGNERSEAM`, `SEAMSVN`, `MRTD`, `RTMR0`, `RTMR1`, and `RTMR3` from passed TD Quote,
+    - extracts TD attributes `MRSEAM`, `MRSIGNERSEAM`, `SEAMSVN`, `MRTD`, `RTMR0`, `RTMR1`, `RTMR2`, and `RTMR3` from passed TD Quote,
     - uses SK<sub>KBS</sub> key for administrator access to Trustee KBS,
     - based on the extracted TD attributes, generates an attestation policy for AS and a resource policy for KBS, which are later uses to validate key retrieval request,
     - sends the root filesystem encryption key (k<sub>RFS</sub>) and corresponding key id (ID<sub>K_RFS</sub>) to KBS, which stores the key k<sub>RFS</sub> in the KMS with id ID<sub>K_RFS</sub>.
 
-11. [On Preparation Host] Update GRUB configuration to boot in TD boot mode `TD_FDE_BOOT`:
-    ```
-    sudo tools/image/fde-encrypt_image.sh TD_FDE_BOOT \
-        -p $PWD/tools/image/tdx-guest-ubuntu-24.04-encrypted.img \
-        -e $PWD/tools/image/tdx-guest-ubuntu-24.04-encrypted.img \
-        -k $k_RFS
-    ```
-
-    In more detail, this script:
-    - changes the TD boot mode in the GRUB kernel command line,
-    - prints the path of the unchanged OVMF file and the path of the adjusted image.
-
-    Example output:
-    ```
-    =============== Created Files ================
-    OVMF_PATH: <Path to OVMF image file> (unchanged)
-    IMAGE_PATH: <Path to encrypted image file>
-    ```
-
 ## Runtime Phase
 
-1. [**On Workload Host**] Boot TD<sub>W</sub> combined with the OVMF image `OVMF_FDE.fd`.
+1. [**On Workload Host**] Boot TD<sub>W</sub> combined with the OVMF image `OVMF_FDE.fd`, the kernel image `vmlinuz`, and initrd `initrd.img`.
+    Make sure the TD image, OVMF image, kernel image, initrd and TD boot parameters file are copied to Workload Host.
 
-    Make sure the respective TD image and OVMF binaries are copied to Workload Host and the paths match the following command:
-    ```
-    TD_IMG=tools/image/tdx-guest-ubuntu-24.04-encrypted.img canonical-tdx/guest-tools/run_td.sh \
-        -d false \
-        -f tools/image/OVMF_FDE.fd
-    ```
+    - If needed, adjust the paths in the TD boot parameters file and load the values to environment parameters:
+        ```
+        source tools/image/td_boot_params.sh
+        ```
+
+    - Boot the TD:
+        ```
+        ./boot_td.sh \
+            -o $OVMF_PATH \
+            -t $TD_IMAGE_PATH \
+            -i $INITRD_PATH \
+            -k $KERNEL_PATH \
+            -u $UUID_PART_ROOTFS \
+            -l $LABEL_DEV_ROOTFS_DEC \
+            -m TD_FDE_BOOT
+        ```
 
     During the TD boot, the FDE Agent in initramfs performs the following steps:
     - extracts Trustee KBS URL and key id (ID<sub>K_RFS</sub>) corresponding to root filesystem encryption key (k<sub>RFS</sub>) from OVMF image,
@@ -732,8 +737,8 @@ Please adjust the commands according to your environment.
 ## Limitations
 
 - The integrity of the actual workload is not protected.
-- The integrity of the components measured in RTMR2 are not protected.
-- Only QEMU-based boot using Canonical's `run_td.sh` is supported at the moment.
+- The integrity of kernel command line is not protected.
+- Only QEMU-based boot using Canonical's `direct_boot.sh` is supported at the moment.
     This script does only support one TD at a time.
 - Trustee KBS and HashiCorp Vault (KMS) currently don't communicate over a secure channel.
 - HashiCorp Vault will loose all root filesystem encryption keys on reboot as it runs in development environment.
