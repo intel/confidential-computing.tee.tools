@@ -1,4 +1,4 @@
-// Copyright (C) 2025 Intel Corporation
+// Copyright (C) 2025 - 2026 Intel Corporation
 // SPDX-License-Identifier: BSD-3-Clause
 
 use anyhow::{anyhow, Ok, Result};
@@ -7,7 +7,7 @@ use clap::Parser;
 use rsa::{RsaPrivateKey, RsaPublicKey, rand_core::OsRng};
 use zeroize::Zeroize;
 use utils::{
-    key_broker::{KBS, ItaKbs},
+    key_broker_client::{KBS, ItaKbs},
     ovmf_var::{OvmfParamsBootMode, OvmfParamsGetQuote, OvmfParamsFdeBoot},
     quote::*,
     rsa_ext::RsaPublicKeyExt,

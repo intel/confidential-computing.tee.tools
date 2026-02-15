@@ -1,4 +1,4 @@
-// Copyright (C) 2025 Intel Corporation
+// Copyright (C) 2025 - 2026 Intel Corporation
 // SPDX-License-Identifier: BSD-3-Clause
 
 // TODO: Setup a quote retrieval HTTP(S) endpoint in the TD (by creating a variant of the fde-quote-gen code). Then, the script can retrieve the quote from outside the TD, handle the quote, send the necessary data to ITA KBS, and retrieve the key. This is very important for TD that do not offer any login capability!
@@ -15,7 +15,7 @@ use rsa::{
     RsaPublicKey,
 };
 use utils::{
-    key_broker::{KBS, ItaKbs},
+    key_broker_client::{KBS, ItaKbs},
     quote::Quote,
     rsa_ext::RsaPublicKeyExt,
 };
