@@ -1,11 +1,10 @@
-// Copyright (C) 2025 Intel Corporation
+// Copyright (C) 2025 - 2026 Intel Corporation
 // SPDX-License-Identifier: BSD-3-Clause
 
 use std::process::Command;
 use std::io::Write;
 
-pub const K_RFS_BIT_LENGTH: usize = 256;
-pub const K_RFS_ALGO : &str = "AES";
+pub const K_RFS_BIT_LENGTH: usize = 512;
 
 /// Opens the root device and attempts to load it as a LUKS2 encrypted device.
 ///
@@ -15,26 +14,28 @@ pub const K_RFS_ALGO : &str = "AES";
 /// - `label_dev_rootfs_dec`:  Label of device providing decrypted access to encrypted root partition.
 /// - `key`: Key used to decrypt the encrypted device.
 ///
+/// # Returns
+///
+/// - `Ok(())` if the LUKS device was successfully opened with the provided key.
+///
 /// # Errors
 ///
-/// - If the root device is not available, it will panic with the message "FDE: root device is not available".
-/// - If loading LUKS2 fails, it will panic with the message "FDE: Loading LUKS2 failed".
+/// - If the device label from boot parameters is empty.
+/// - If the cryptsetup command fails to execute.
+/// - If writing the key to stdin of the cryptsetup process fails.
+/// - If the cryptsetup process cannot be awaited for completion.
+/// - If cryptsetup returns a non-zero exit code (e.g., wrong key, device not found).
 pub fn crypt_setup(label_part_rootfs_enc: String, label_dev_rootfs_dec: String, key: &[u8]) {
-    // Ensure that device has a valid name.
-    // If none was provided, use last segment of name of partition with encrypted root filesystem
-    let mut _label_dev_rootfs_dec = label_dev_rootfs_dec.as_str();
-    if _label_dev_rootfs_dec.is_empty() {
-        _label_dev_rootfs_dec = label_part_rootfs_enc
-            .split('/')
-            .next_back()
-            .expect("FDE: Set device name failed.");
+    // Check if the device label from boot parameters is empty.
+    if label_dev_rootfs_dec.is_empty() {
+        panic!("FDE: Set device name failed.");
     }
 
     // Construct the bash command to open LUKS device.
     // Note: cryptsetup_rs crate cannot be used as it collides with key generation.
     let command = format!(
-        "cryptsetup luksOpen --key-file - --key-size 256 {} {}",
-        label_part_rootfs_enc, _label_dev_rootfs_dec
+        "cryptsetup luksOpen --key-file - --key-size 512 {} {}",
+        label_part_rootfs_enc, label_dev_rootfs_dec
     );
 
     // Execute the bash command to open LUKS device.
@@ -42,18 +43,26 @@ pub fn crypt_setup(label_part_rootfs_enc: String, label_dev_rootfs_dec: String, 
         .arg("-c")
         .arg(&command)
         .stdin(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .spawn()
-        .expect("FDE: Failed to execute cryptsetup command");
+        .unwrap_or_else(|e| panic!("FDE: Failed to execute cryptsetup command: {}", e));
 
+    // Write the key to the stdin of the cryptsetup command.
     child.stdin
         .as_mut()
-        .expect("FDE: Failed to open stdin")
+        .unwrap_or_else(|| panic!("FDE: Failed to open stdin"))
         .write_all(key)
-        .expect("FDE: Failed to write key to stdin");
+        .unwrap_or_else(|e| panic!("FDE: Failed to write key to stdin: {}", e));
 
     // Check the output status
-    child.wait_with_output()
-        .expect("FDE: Failed to read cryptsetup command output");
+    let output = child.wait_with_output()
+        .unwrap_or_else(|e| panic!("FDE: Failed to read cryptsetup command output: {}", e));
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        panic!("FDE: cryptsetup luksOpen failed with exit code {:?}: {}",
+               output.status.code(), stderr);
+    }
 
     println!("LUKS device opened successfully");
 }

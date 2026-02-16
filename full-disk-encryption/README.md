@@ -1,4 +1,4 @@
-# Full Disk Encryption Solution for a Intel TDX
+# Full Disk Encryption Solution for Intel TDX
 
 In short, the goal of this solution is that a Workload Owner is able to protect all data and code of its workload in use and at rest.
 The data in use protection is provided by putting the workload inside a VM protected by [Intel® Trust Domain Extensions (Intel® TDX)](https://www.intel.com/content/www/us/en/developer/articles/technical/intel-trust-domain-extensions.html), i.e., by Trust Domains (TDs).
@@ -53,7 +53,7 @@ Overall, the following components play a role in the two phases:
     The Preparation host does not require Intel TDX support.
 - A "Workload Host" that starts a TD based on the prepared UEFI firmware and TD image.
     The Workload Host requires Intel TDX support.
-- A "Key Management Service (KMS)" for securely creating and storing the key used for FDE.
+- A "Key Management Service (KMS)" for securely storing the key used for FDE.
 - An "Attestation Service" responsible to verify a TD Quote.
 - A "Key Broker Service (KBS)" responsible for accepting a TD Quote, forwarding the TD Quote to the Attestation Service for quote verification, requesting the key used for FDE from the KMS, and securely return the key into the TD.
 
@@ -76,20 +76,18 @@ The fourth step is elaborate in itself and we want to present a few details here
 The goal of this task is to prepare a UEFI firmware (e.g., OVMF or TDVF) and a TD image.
 The UEFI firmware must be enabled for Intel TDX and its integrity is protected by remote attestation.
 The TD image contains a bootloader, a Linux kernel, initramfs with an "FDE Agent", and a root filesystem partition with the OS and workload.
-The root filesystem is encrypted using LUKS2 and all other pieces of the TD image are integrity protected by remote attestation.
+The Workload Owner generates a key, encrypts the root filesystem with this key using LUKS2, and stores the key in the KMS.
+All other pieces of the TD image are integrity protected by remote attestation.
 
 The following figure shows result of the preparation and the boot flow of the components:
 
 ![](figures/overview_preparation.png)
 
-During the creation of the UEFI Firmware and the TD image, the KMS is responsible for creating and providing a key used for the LUKS2 encryption.
-
-
 ### Runtime Phase
 
 On a high level, the following is done during the runtime phase, which is also visualized in the next figure:
 1. Boot the TD until initramfs.
-2. Initramfs starts the FDE Agent, which request a TD Quote (i.e., attestation evidence) from hardware.
+2. Initramfs starts the FDE Agent, which requests a TD Quote (i.e., attestation evidence) from hardware.
 3. FDE Agent sends the TD Quote to the KBS.
 4. KBS forwards the TD Quote to the Attestation Service.
 5. Attestation Service performs quote verification and returns the verification result.
@@ -103,13 +101,14 @@ On a high level, the following is done during the runtime phase, which is also v
 
 ## Detailed Recipe for FDE + Intel TDX
 
-For this detailed recipe of our solution, we assume that [HashiCorp Vault](https://www.hashicorp.com/de/products/vault) is used as KMS, [Intel® Tiber™ Trust Authority (ITA)](https://www.intel.com/content/www/us/en/security/trust-authority.html) is used as Attestation Service, and [Intel Trust Authority Key Broker Service (ITA KBS)](https://docs.trustauthority.intel.com/main/articles/articles/ita/key-broker-service.html) is used as a KBS.
+For this detailed recipe of our solution, we assume that [HashiCorp Vault](https://www.hashicorp.com/de/products/vault) is used as KMS, [Trustee's Attestation Service](https://github.com/confidential-containers/trustee/tree/v0.15.0/attestation-service) is used as Attestation Service (AS), and [Trustee's Key Broker Service](https://github.com/confidential-containers/trustee/tree/v0.15.0/kbs) is used as Key Broker Service (KBS).
 As mentioned before, we do not make any assumption where exactly all the individual components are deployed - the components might run on the same physical machine, some components might be co-located, or each might be on a separate machine.
 
 For ease of explanation in this recipe, **we assume that all components are deployed on the same physical machine**.
 Please adjust the commands according to your environment.
 
-Note that the TD image using FDE currently only supports Ubuntu 24.04.
+> [!NOTE]
+> The TD image using FDE currently only supports Ubuntu 24.04, which is also used as the host OS throughout this recipe.
 
 ### Preparation Phase
 
@@ -119,133 +118,374 @@ Note that the TD image using FDE currently only supports Ubuntu 24.04.
 2. Setup the host OS and BIOS settings following the [Setup Host OS section](https://github.com/canonical/tdx/tree/3.1?tab=readme-ov-file#4-setup-host-os) of Canonical's guide.
 3. Setup remote attestation and register your platform according to the [Setup Intel® SGX Data Center Attestation Primitives (Intel® SGX DCAP) on the Host OS section](https://github.com/canonical/tdx/tree/3.1?tab=readme-ov-file#82-setup-intel-sgx-data-center-attestation-primitives-intel-sgx-dcap-on-the-host-os) of Canonical's guide.
 
+#### Prerequisites for KMS, AS, and KBS
 
-#### Setup HashiCorp Vault as a KMS
-1. Install Vault:
-    ```
-    wget -O - https://apt.releases.hashicorp.com/gpg | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
-    sudo apt update && sudo apt install vault
-    ```
-    For more details, refer to [HashiCorp's installation instructions](https://developer.hashicorp.com/vault/install#linux).
-2. Create a 128bit, random Vault root token and start Vault in development mode:
-    ```
-    export VAULT_ROOT_TOKEN=$(openssl rand -hex 16)
-    vault server -dev -dev-root-token-id $VAULT_ROOT_TOKEN &
-    ```
-    Development mode should only be used in a development environment - not in production.
-    Follow the instructions provided by HashiCorp for a production setup.
-3. The last command returns the address of Vault, which we refer to as `<Vault address>` in the following.
-    Export address of Vault for later steps:
-    ```
-    export VAULT_ADDR='<Vault address>'
-    ```
-4. Login to Vault:
-    ```
-    vault login $VAULT_ROOT_TOKEN
-    ```
-5. Enable a [key-value secret engine](https://developer.hashicorp.com/vault/docs/v1.18.x/secrets/kv) inside Vault at path
-    `keybroker`:
-    ```
-    vault secrets enable -path=keybroker kv
-    ```
-
-#### Setup ITA KBS as KBS
-1. Install build dependencies:
-    ```
-    sudo apt install -y make
-    ```
-2. Install Docker and enable it for non-root users
+1. Install Docker and enable it for non-root users:
     ```
     curl -fsSL https://get.docker.com -o get-docker.sh
     sudo sh get-docker.sh
-    sudo groupadd docker
     sudo usermod -aG docker $USER
     newgrp docker
     ```
     See [Docker's installation documentation](https://docs.docker.com/engine/install/ubuntu/) for more detailed information.
-3. Download and build ITA KBS:
-    ```
-    git clone -b v1.3.0 https://github.com/intel/trustauthority-kbs.git ita-kbs
-    pushd ita-kbs
-    make docker
-    ```
-4. Export the following environment variables according to your needs by replacing the placeholder for the KBS admin username (`<KBS admin username>`), KBS admin password (`<KBS admin password>`), and Intel Trust Authority API Key (`<ITA API key>`) for later steps:
-    ```
-    export KBS_ADMIN_USERNAME=<KBS admin username>
-    export KBS_ADMIN_PASSWORD=<KBS admin password>
-    export ITA_API_KEY=<ITA API key>
-    export KBS_EXTERNAL_IP=$(hostname -I | awk '{print $1}')
-    ```
-    Note: Minimum length for KBS_ADMIN_PASSWORD is 9 characters.
 
-5. Create a configuration file `kbs.env` for ITA KBS:
+2. Create a Docker network for Trustee services to communicate:
     ```
-    eval $(echo $VAULT_ADDR | awk -F[/:] '{printf "VAULT_SERVER_IP=%s\nVAULT_SERVER_PORT=%s\n", $4, $5}')
+    docker network create trustee-net
+    ```
 
-    cat << EOF > kbs.env
-    LOG_LEVEL=DEBUG
-    KEY_MANAGER=VAULT
-    ADMIN_USERNAME=$KBS_ADMIN_USERNAME
-    ADMIN_PASSWORD=$KBS_ADMIN_PASSWORD
-    TRUSTAUTHORITY_API_URL=https://api.trustauthority.intel.com
-    TRUSTAUTHORITY_API_KEY=$ITA_API_KEY
-    TRUSTAUTHORITY_BASE_URL=https://portal.trustauthority.intel.com
-    SAN_LIST=$KBS_EXTERNAL_IP
-    VAULT_SERVER_IP=$VAULT_SERVER_IP
-    VAULT_SERVER_PORT=$VAULT_SERVER_PORT
-    VAULT_CLIENT_TOKEN=$VAULT_ROOT_TOKEN
+3. Download FDE solution and move into its directory:
+    ```
+    git clone --recurse-submodules https://github.com/intel/confidential-computing.tee.tools.git fde
+    pushd fde/full-disk-encryption/
+    ```
+
+    > NOTE: This will also clone Trustee's repository with tag `v0.15.0` and Canonical's Intel TDX repository with tag `3.1` inside `full-disk-encryption` directory.
+
+4. Create configuration directory for Trustee's AS and KBS:
+    ```
+    mkdir -p trustee/config-data/reference-values/
+    ```
+
+5. Set system IP and configure proxy settings for Docker:
+    ```
+    SYSTEM_IP=$(hostname -I | awk '{print $1}')
+    export NO_PROXY=${SYSTEM_IP},trustee-as,trustee-kbs,trustee-vault
+    ```
+
+6. Create a file about the KMS, AS, and KBS setup configuration:
+    ```
+    SETUP_CONFIG_FILE=$PWD/setup_config.sh
+    cat > "$SETUP_CONFIG_FILE" <<EOF
+    #!/bin/bash
+
+    SETUP_CONFIG_FILE="$SETUP_CONFIG_FILE"
+    export NO_PROXY="$NO_PROXY"
+    SYSTEM_IP="$SYSTEM_IP"
+    VAULT_ROOT_TOKEN=
+    KBS_PORT=
+    KBS_URL=
+    KBS_CERT_PATH=
+    SK_KBS_ADMIN=
     EOF
     ```
-    Note that the list of Subject Alternative Names (`SAN_LIST`) contains `KBS_EXTERNAL_IP`, the external IP of the machine hosting the KBS.
-    `127.0.0.1` cannot be used in this case, because the KBS is called from within a TD during the TD boot.
 
-    See the [ITA KBS documentation](https://docs.trustauthority.intel.com/main/articles/articles/ita/key-broker-service-install.html) for more details about the settings in the configuration file.
-6. If you are running behind a proxy, provide the HTTP proxy configuration (`<http proxy>`) and HTTPS proxy configuration (`<https proxy>`):
+    This file can be used to conveniently continue the setup after a machine reboot or when a new terminal is used.
+
+#### Setup HashiCorp Vault as a KMS
+
+1. Create a 128bit, random root token for Vault and start Vault in development mode:
     ```
-    http_proxy=<http proxy>
-    https_proxy=<https proxy>
+    VAULT_ROOT_TOKEN=$(openssl rand -hex 16)
+
+    docker run -d \
+        --name trustee-vault \
+        --network trustee-net \
+        --restart unless-stopped \
+        -e VAULT_DEV_ROOT_TOKEN_ID="$VAULT_ROOT_TOKEN" \
+        -e VAULT_DEV_LISTEN_ADDRESS=0.0.0.0:8200 \
+        -e VAULT_ADDR=http://127.0.0.1:8200 \
+        -e VAULT_TOKEN="$VAULT_ROOT_TOKEN" \
+        -e no_proxy="$NO_PROXY" \
+        --cap-add=IPC_LOCK \
+        hashicorp/vault:1.20 \
+        sh -c "docker-entrypoint.sh server -dev & until vault status >/dev/null 2>&1; do sleep 1; done; vault secrets enable -version=1 -path=keybroker kv 2>/dev/null || true && wait"
     ```
-7. Setup directories for ITA KBS:
+    > NOTE: Development mode should only be used in a development environment - not in production.
+    > In development mode, all data is only stored in memory and thus all secrets are gone on reboot.
+    > Follow the instructions provided by HashiCorp for a production setup.
+
+    > NOTE: If the service runs behind a proxy, use the following additional options in the `docker run` (after adjusting according to your proxy setup): `-e http_proxy="<HTTP proxy>` and `-e https_proxy="<HTTPS proxy>"`.
+
+    > NOTE: Above command will also enable a [key-value secret engine](https://developer.hashicorp.com/vault/docs/v1.18.x/secrets/kv) inside Vault at path `keybroker`.
+
+2. Add important Vault settings to setup configuration file:
     ```
-    mkdir -p data/users data/keys data/keys-transfer-policy data/certs/tls data/certs/signing-keys
+    sed -i "/^VAULT_ROOT_TOKEN=/c\\VAULT_ROOT_TOKEN=\"${VAULT_ROOT_TOKEN}\"" "$SETUP_CONFIG_FILE"
     ```
-8. Start ITA KBS (which by default is accessible at the IP `127.0.0.1` at port `9443`):
+
+#### Setup Trustee's Attestation Service as AS:
+
+1. Move into of Trustee directory:
+    ```
+    pushd trustee/
+    ```
+
+2. Pin DCAP packages to version 1.23 in the Attestation Service Dockerfile:
+    ```
+    sed -i \
+        -e 's|ubuntu jammy main|ubuntu noble main|g' \
+        -e '/intel-sgx\.list.*&& \\/a\    curl -sSLf https://download.01.org/intel-sgx/sgx_repo/ubuntu/apt_preference_files/99sgx_2_26_100_noble_custom_version.cfg | tee -a /etc/apt/preferences.d/99sgx_sdk && \\' \
+        attestation-service/docker/as-grpc/Dockerfile
+    ```
+
+3. Build Docker image of AS:
+    ```
+    docker build \
+        --build-arg no_proxy="$NO_PROXY" \
+        --ulimit nofile=90000:90000 \
+        -f attestation-service/docker/as-grpc/Dockerfile \
+        -t trustee-as:latest .
+    ```
+
+    > NOTE: If the service runs behind a proxy, use the following additional options in the `docker build` (after adjusting according to your proxy setup): `--build-arg http_proxy="<HTTP proxy>` and `--build-arg https_proxy="<HTTPS proxy>"`.
+
+4. Create a configuration file for AS:
+    ```
+    cat > config-data/as-config.json <<EOF
+    {
+        "policy_engine": "opa",
+        "rvps_config": {
+            "type": "BuiltIn",
+            "storage": {
+                "type": "LocalFs",
+                "file_path": "/opt/attestation-service/reference-values"
+            }
+        },
+        "attestation_token_broker": {
+            "type": "Ear",
+            "duration_min": 5
+        }
+    }
+    EOF
+    ```
+
+5. Start AS:
     ```
     docker run -d \
-    --restart unless-stopped \
-    --name kbs \
-    --env-file $PWD/kbs.env \
-    --net=host \
-    -v $PWD/data/certs:/etc/kbs/certs \
-    -v /etc/hosts:/etc/hosts \
-    -v $PWD/data:/opt/kbs \
-    trustauthority/key-broker-service:v1.3.0
+        --name trustee-as \
+        --network trustee-net \
+        --restart unless-stopped \
+        --ulimit nofile=90000:90000 \
+        -v "$(pwd)/config-data/as-config.json:/opt/attestation-service/config.json:ro" \
+        -v "$(pwd)/config-data/reference-values:/opt/attestation-service/reference-values" \
+        -v "$(pwd)/attestation-service/docs/sgx_default_qcnl.conf:/etc/sgx_default_qcnl.conf:ro" \
+        -e no_proxy="$NO_PROXY" \
+        trustee-as:latest \
+        grpc-as --config-file /opt/attestation-service/config.json --socket 0.0.0.0:3000
     ```
-9. Export ITA KBS specific parameters for later steps (adjusting the parameters if necessary):
-    ```
-    export KBS_URL="https://${KBS_EXTERNAL_IP}:9443"
-    export KBS_ENV=$PWD/kbs.env
-    export KBS_CERT_PATH=$PWD/data/certs/tls/tls.crt
-    ```
-10. Move out of ITA KBS directory:
+
+    > NOTE: Use `-e RUST_LOG=debug` with above command for more detailed logs.
+
+    > NOTE: If the service runs behind a proxy, use the following additional options in the `docker run` (after adjusting according to your proxy setup): `-e http_proxy="<HTTP proxy>` and `-e https_proxy="<HTTPS proxy>"`.
+
+6. Move out of Trustee directory:
     ```
     popd
     ```
-11. Check ITA KBS logs for successful start:
+
+7. Verify AS deployment by checking its Docker logs:
     ```
-    docker logs kbs
+    docker logs trustee-as
     ```
-    The last log entry is expected to contain `service started`.
+    The log entry is expected to contain:
+    ```
+    [<date and time> INFO  grpc_as] CoCo AS:
+    v0.1.0
+    commit:
+    buildtime: <date and time> +00:00
+    [<date and time> INFO  grpc_as::grpc] Starting gRPC Attestation Service. Listening on socket: 0.0.0.0:3000
+    [<date and time> INFO  attestation_service::rvps] launch a built-in RVPS.
+    [<date and time> WARN  reference_value_provider_service::extractors] No configuration for SWID extractor provided. Default will be used.
+    [<date and time> INFO  attestation_service::token::ear_broker] No Token Signer key in config file, create an ephemeral key and without CA pubkey cert
+    ```
+
+#### Setup Trustee's Key Broker Service as KBS:
+
+1. Move into of Trustee directory:
+    ```
+    pushd trustee/
+    ```
+
+2. Add Vault support in Dockerfile of KBS:
+    ```
+    sed -i "s/make AS_FEATURE=coco-as-grpc/make background-check-kbs VAULT=true AS_FEATURE=coco-as-grpc/" kbs/docker/coco-as-grpc/Dockerfile
+    ```
+
+3. Build Docker image of KBS:
+    ```
+    docker build \
+        --build-arg no_proxy="$NO_PROXY" \
+        --ulimit nofile=90000:90000 \
+        -f kbs/docker/coco-as-grpc/Dockerfile \
+        -t trustee-kbs:latest .
+    ```
+
+    > NOTE: If the service runs behind a proxy, use the following additional options in the `docker build` (after adjusting according to your proxy setup): `--build-arg http_proxy="<HTTP proxy>` and `--build-arg https_proxy="<HTTPS proxy>"`.
+
+4. Generate self-signed certificate used for HTTPS communication with KBS:
+
+    > NOTE: The self-signed certificate generated by these instructions is intended **for demo and testing purposes only**.
+    > It is inherently insecure and **MUST NOT be used in a production environment**.
+    > For production deployments, you must use a certificate issued by a trusted root Certificate Authority (CA) to ensure secure communication.
+
+    - Move into Trustee configuration folder:
+        ```
+        pushd config-data/
+        ```
+    - Create certificate configuration - adjust to your needs:
+        ```
+        cat > cert.conf <<EOF
+        [req]
+        default_bits = 3072
+        default_md = sha256
+        distinguished_name = req_distinguished_name
+        req_extensions = req_ext
+        x509_extensions = v3_ca
+        [req_distinguished_name]
+        countryName = Country Name (2 letter code)
+        countryName_default = US
+        stateOrProvinceName = State or Province Name (full name)
+        stateOrProvinceName_default = CA
+        localityName = Locality Name (eg, city)
+        localityName_default = San Francisco
+        organizationName  = Organization Name (eg, company)
+        organizationName_default = Organization
+        organizationalUnitName = organizationalunit
+        organizationalUnitName_default = Development
+        commonName = Common Name (e.g. server FQDN or YOUR name)
+        commonName_default = localhost
+        commonName_max = 64
+        [req_ext]
+        subjectAltName = @alt_names
+        [v3_ca]
+        subjectAltName = @alt_names
+        [alt_names]
+        IP.1 = $SYSTEM_IP
+        EOF
+        ```
+    - Generate self-signed certificate and its private key, and adjust the permission of these files:
+        ```
+        openssl req -x509 -nodes -days 365 -newkey rsa:3072 \
+          -keyout kbs.key.pem -out kbs.cert.pem \
+          -config cert.conf -batch
+
+        chmod 600 kbs.key.pem
+        chmod 644 kbs.cert.pem
+        ```
+    - Move out of Trustee configuration folder:
+        ```
+        popd
+        ```
+
+5.  Generate asymmetric key pair (SK<sub>KBS</sub>/PK<sub>KBS</sub>) used for administrator access to KBS.
+    ```
+    pushd config-data/
+
+    openssl genpkey -algorithm ed25519 > sk_kbs_admin.pem
+    openssl pkey -in sk_kbs_admin.pem -pubout -out pk_kbs_admin.pem
+
+    chmod 600 sk_kbs_admin.pem
+    chmod 644 pk_kbs_admin.pem
+
+    popd
+    ```
+
+6. Set important settings of AS to environment variable and add them to setup configuration file:
+    ```
+    KBS_PORT=8080
+    KBS_URL="https://${SYSTEM_IP}:${KBS_PORT}"
+    KBS_CERT_PATH="$PWD/config-data/kbs.cert.pem"
+    SK_KBS_ADMIN="$PWD/config-data/sk_kbs_admin.pem"
+
+    sed -i "/^KBS_PORT=/c\\KBS_PORT=\"${KBS_PORT}\"" "$SETUP_CONFIG_FILE"
+    sed -i "/^KBS_URL=/c\\KBS_URL=\"${KBS_URL}\"" "$SETUP_CONFIG_FILE"
+    sed -i "/^KBS_CERT_PATH=/c\\KBS_CERT_PATH=\"${KBS_CERT_PATH}\"" "$SETUP_CONFIG_FILE"
+    sed -i "/^SK_KBS_ADMIN=/c\\SK_KBS_ADMIN=\"${SK_KBS_ADMIN}\"" "$SETUP_CONFIG_FILE"
+    ```
+
+7. Create a configuration file for KBS:
+    ```
+    cat > config-data/kbs-config.toml <<EOF
+    [http_server]
+    sockets = ["0.0.0.0:8080"]
+    private_key = "/opt/kbs/certs/kbs.key.pem"
+    certificate = "/opt/kbs/certs/kbs.cert.pem"
+    insecure_http = false
+
+    [attestation_token]
+    insecure_key = true
+
+    [attestation_service]
+    type = "coco_as_grpc"
+    as_addr = "http://trustee-as:3000"
+    policy_engine = "opa"
+
+    [attestation_service.attestation_token_broker]
+    type = "Ear"
+    duration_min = 5
+
+    [attestation_service.rvps_config]
+    type = "BuiltIn"
+
+    [admin]
+    auth_public_key = "/opt/kbs/certs/pk_kbs_admin.pem"
+
+    [[plugins]]
+    name = "resource"
+    type = "Vault"
+    vault_url = "http://trustee-vault:8200"
+    token = "$VAULT_ROOT_TOKEN"
+    mount_path = "keybroker"
+    kv_version = 1
+    EOF
+    ```
+
+8. Start KBS:
+    ```
+    docker run -d \
+        --name trustee-kbs \
+        --network trustee-net \
+        --restart unless-stopped \
+        --ulimit nofile=90000:90000 \
+        -p $KBS_PORT:8080 \
+        -v "$(pwd)/config-data/kbs-config.toml:/opt/kbs/kbs-config.toml:ro" \
+        -v "$(pwd)/config-data/kbs.cert.pem:/opt/kbs/certs/kbs.cert.pem:ro" \
+        -v "$(pwd)/config-data/kbs.key.pem:/opt/kbs/certs/kbs.key.pem:ro" \
+        -v "$(pwd)/config-data/pk_kbs_admin.pem:/opt/kbs/certs/pk_kbs_admin.pem:ro" \
+        -e no_proxy="$NO_PROXY" \
+        trustee-kbs:latest \
+        kbs --config-file /opt/kbs/kbs-config.toml
+    ```
+    > NOTE: Use `-e RUST_LOG=debug` with above command for more detailed logs.
+
+9. Move out of Trustee directory:
+    ```
+    popd
+    ```
+
+10. Verify KBS deployment by checking Docker logs:
+    ```
+    docker logs trustee-kbs
+    ```
+    The log entry is expected to contain:
+    ```
+    [<date and time> INFO  kbs] Using config file /opt/kbs/kbs-config.toml
+    [<date and time> INFO  tracing::span] new;
+    [<date and time> WARN  vaultrs::client] Disabling TLS verification
+    [<date and time> INFO  kbs::attestation::coco::grpc] connect to remote AS [http://trustee-as:3000] with pool size 100
+    [<date and time> INFO  kbs::api_server] Starting HTTPS server at [0.0.0.0:8080]
+    [<date and time> INFO  actix_server::builder] starting 256 workers
+    [<date and time> INFO  actix_server::server] Actix runtime found; starting in Actix runtime
+    [<date and time> INFO  actix_server::server] starting service: "actix-web-service-0.0.0.0:8080", workers: 256, listening on: 0.0.0.0:8080
+    ```
 
 #### Prepare UEFI Firmware and TD image on Preparation Host and Workload Host.
 
-1. [On Preparation Host] Setup and Build FDE Binaries
-    - Install build dependencies:
+1. [**On Preparation Host**] Install dependencies for FDE Binaries:
+    - Set up the appropriate Intel SGX package repository:
         ```
-        sudo apt update && sudo apt install -y \
-        pkg-config gpg wget openssl libcryptsetup-dev python3-venv \
-        libtdx-attest-dev qemu-system-x86
+        echo 'deb [signed-by=/etc/apt/keyrings/intel-sgx-keyring.asc arch=amd64] https://download.01.org/intel-sgx/sgx_repo/ubuntu noble main' | sudo tee /etc/apt/sources.list.d/intel-sgx.list
+        wget https://download.01.org/intel-sgx/sgx_repo/ubuntu/intel-sgx-deb.key
+        sudo mkdir -p /etc/apt/keyrings
+        cat intel-sgx-deb.key | sudo tee /etc/apt/keyrings/intel-sgx-keyring.asc > /dev/null
+        sudo apt-get update
+        ```
+    - Install the required packages:
+        ```
+        sudo apt update && sudo apt install -y --allow-downgrades \
+            pkg-config gpg wget openssl libcryptsetup-dev python3-venv \
+            libtdx-attest-dev qemu-system-x86 libtss2-dev build-essential
         ```
     - Install Rust, activate Rust in current shell, and test Rust installation:
         ```
@@ -255,30 +495,28 @@ Note that the TD image using FDE currently only supports Ubuntu 24.04.
         ```
         See [Rust's installation documentation](https://www.rust-lang.org/tools/install) for more detailed information.
 
-    - Download FDE solution:
-        ```
-        git clone git@github.com:IntelConfidentialComputing/TDXSampleUseCases.git fde
-        pushd fde/full-disk-encryption
-        ```
+2. [On Preparation Host] Download FDE solution and move into its directory:
+    ```
+    git clone --recurse-submodules https://github.com/intel/confidential-computing.tee.tools.git fde
+    pushd fde/full-disk-encryption/
+    ```
 
-    - Build FDE Binaries:
-        ```
-        cargo build --release --manifest-path fde-binaries/Cargo.toml
-        ```
+    > NOTE: This will also clone Trustee's repository with tag `v0.15.0` and Canonical's Intel TDX repository with tag `3.1` inside `full-disk-encryption` directory.
 
-        - If the build fails with error `error: failed to add native library /lib/x86_64-linux-gnu/libm.a: file too small to be an archive` or `error: failed to add native library /lib/x86_64-linux-gnu/libm.a: Unsupported archive identifier`, please execute below workaround and re-build:
-            ```
-            sudo ln -f /lib/x86_64-linux-gnu/libm-2.39.a /lib/x86_64-linux-gnu/libm.a
-            ```
+3. [On Preparation Host] Build FDE Binaries:
+    ```
+    cargo build --release --manifest-path fde-binaries/Cargo.toml
+    ```
 
-2. [On Preparation Host] Create TD image TD<sub>W</sub> with workload, a dummy key used for FDE, and key pair used for key retrieval from ITA KBS:
-    - Clone Canonical's Intel TDX repository and patch the TD launch script:
+    > NOTE: If the build fails with error `error: failed to add native library /lib/x86_64-linux-gnu/libm.a: file too small to be an archive` or `error: failed to add native library /lib/x86_64-linux-gnu/libm.a: Unsupported archive identifier`, please execute below workaround and re-build:
+    > ```
+    > sudo ln -f /lib/x86_64-linux-gnu/libm-2.39.a /lib/x86_64-linux-gnu/libm.a
+    > ```
+
+4. [On Preparation Host] Create TD image TD<sub>W</sub> with workload, a dummy key used for FDE, and key pair used for key retrieval from Trustee KBS:
+    - Activate automatic attestation packages installation inside of the image:
         ```
-        git clone -b 3.1 https://github.com/canonical/tdx.git canonical-tdx
-        cp patches/setup-tdx-config.patch canonical-tdx/
-        pushd canonical-tdx
-        git apply setup-tdx-config.patch
-        popd
+        sed -i "s/^TDX_SETUP_ATTESTATION=0$/TDX_SETUP_ATTESTATION=1/" canonical-tdx/setup-tdx-config
         ```
 
     - Create TD base image (TD<sub>B</sub>) with your workload.
@@ -288,27 +526,26 @@ Note that the TD image using FDE currently only supports Ubuntu 24.04.
             sudo ./create-td-image.sh -v 24.04
             popd
             ```
+            > NOTE: If you're behind a proxy, use `sudo -E` to preserve user environment.
 
-            The configuration of the `create-td-image.sh` script can be adjusted in the the configuration file `canonical-tdx/setup-tdx-config`.
-            Additionally, the file `canonical-tdx/guest-tools/image/setup.sh` contains information about installation steps executes inside the TD image.
+            The configuration of the `create-td-image.sh` script can be adjusted in the configuration file `canonical-tdx/setup-tdx-config`.
+            Additionally, the file `canonical-tdx/guest-tools/image/setup.sh` contains information about installation steps executed inside the TD image.
 
             The resulting image will be generated at `canonical-tdx/guest-tools/image/tdx-guest-ubuntu-24.04-generic.qcow2`.
-        - Enrich the base image with the workload you want to be contained.
-            For example, `virt-customize` can be used to adjust the base image.
+        - Enrich the Ubuntu 24.04 base image with the workload you want to be contained.
+            For example, `virt-customize` can be used for this adjustment.
 
-    - Generate a dummy key pair (SK<sub>KR</sub>/PK<sub>KR</sub>), which is used for key retrieval from ITA KBS:
+    - Create directory for image-related data:
         ```
-        mkdir -p data
-        openssl genrsa -out $PWD/data/sk_kr.pem 3072
-        openssl rsa -in $PWD/data/sk_kr.pem -outform PEM -pubout -out $PWD/data/pk_kr.pem
+        mkdir data
         ```
 
     - Create dummy key used for initial FDE:
         ```
-        openssl rand -hex 32 > data/tmp_k_rfs
+        openssl rand -hex 64 > data/tmp_k_rfs
         ```
 
-    - Download OVMF:
+    - Download and extracts OVMF:
         ```
         wget https://launchpad.net/~kobuk-team/+archive/ubuntu/tdx-release/+files/ovmf_2024.02-3+tdx1.0_all.deb -P data/
         dpkg-deb -x data/ovmf_*.deb data/ovmf-extracted
@@ -319,24 +556,23 @@ Note that the TD image using FDE currently only supports Ubuntu 24.04.
         sudo tools/image/fde-encrypt_image.sh GET_QUOTE \
             -p $PWD/canonical-tdx/guest-tools/image/tdx-guest-ubuntu-24.04-generic.qcow2 \
             -e $PWD/tools/image/tdx-guest-ubuntu-24.04-encrypted.img \
-            -f $PWD/data/pk_kr.pem \
             -d $PWD/data/tmp_k_rfs \
             -c $KBS_CERT_PATH
         ```
 
-        Note: The dummy TD image TD<sub>W</sub> requires enough disk space for the following pieces: (1) space for data from the (enriched) base image TD<sub>B</sub>, (2) space for data generated at runtime, and (3) space for encryption overhead of approximately 1GB.
-        By default, we allocate 10GB for the root file system partition, 2GB for the boot partition, and 101MB for BIOS/EFI resulting in of total image size of approximately 12GB.
-        The size of the root file system and boot partitions can be adjusted via command line attributes during the `fde-encrypt_image.sh` invocation.
-        See `sudo tools/image/fde-encrypt_image.sh -h` for more details.
+        > NOTE: The dummy TD image TD<sub>W</sub> requires enough disk space for the following pieces: (1) space for data from the (enriched) base image TD<sub>B</sub>, (2) space for data generated at runtime, and (3) space for encryption overhead of approximately 1GB.
+        > By default, we allocate 10GB for the root filesystem partition, 2GB for the boot partition, and 101MB for BIOS/EFI resulting in of total image size of approximately 12GB.
+        > The size of the root filesystem and boot partitions can be adjusted via command line attributes during the `fde-encrypt_image.sh` invocation.
+        > See `sudo tools/image/fde-encrypt_image.sh -h` for more details.
 
         In more detail, this script:
         - creates a completely new TD image with multiple partitions,
-        - creates a LUKS2 encrypted partition using a hardcoded dummy key,
+        - creates a LUKS2 encrypted partition using the provided dummy key,
         - formats the partitions,
         - fills the encrypted partition with data from the base image TD<sub>B</sub> and FDE binaries,
-        - enrolls dummy parameters about the ITA KBS, the TD boot mode `GET_QUOTE`, and PR_KR into an OVMF image.
+        - enrolls the TD boot mode `GET_QUOTE` into an OVMF image.
 
-        In a later step, the dummy key for the LUKS2 partition and the dummy ITA KBS parameters are replaced by actual values.
+        In a later step, the dummy key for the LUKS2 partition is replaced by actual key.
         Note that changing OVMF variables does not change TD measurements.
 
         Script will print the updated OVMF file path and the updated encrypted image path.
@@ -348,18 +584,20 @@ Note that the TD image using FDE currently only supports Ubuntu 24.04.
         IMAGE_PATH: <Path to encrypted image file>
         ```
 
-3. [**On Workload Host**] Clone FDE solution, Canonical's Intel TDX repository, and patch the TD launch script:
+5. [**On Workload Host**] Download FDE solution and move into its directory:
     ```
-    git clone git@github.com:IntelConfidentialComputing/TDXSampleUseCases.git fde
-    pushd fde/full-disk-encryption
-    git clone -b 3.1 https://github.com/canonical/tdx.git canonical-tdx
-    cp patches/run_td_sh.patch canonical-tdx/
-    pushd canonical-tdx
-    git apply run_td_sh.patch
-    popd
+    git clone --recurse-submodules https://github.com/intel/confidential-computing.tee.tools.git fde
+    pushd fde/full-disk-encryption/
     ```
 
-4. [On Workload Host] Boot TD<sub>W</sub> combined with the OVMF image `OVMF_GET_QUOTE.fd`.
+    > NOTE: This will also clone Trustee's repository with tag `v0.15.0` and Canonical's Intel TDX repository with tag `3.1` inside `full-disk-encryption` directory.
+
+6. [On Workload Host] Patch the TD launch script:
+    ```
+    git -C canonical-tdx apply ../patches/run_td_sh.patch
+    ```
+
+7. [On Workload Host] Boot TD<sub>W</sub> combined with the OVMF image `OVMF_GET_QUOTE.fd`.
     Make sure the respective TD image and OVMF binaries are copied to Workload Host and the paths match the following command:
     ```
     TD_IMG=tools/image/tdx-guest-ubuntu-24.04-encrypted.img \
@@ -368,10 +606,7 @@ Note that the TD image using FDE currently only supports Ubuntu 24.04.
         -f tools/image/OVMF_GET_QUOTE.fd
     ```
 
-    During boot, FDE Agent creates a TD Quote using a hash of PK<sub>KR</sub> as report data.
-    When ITA KBS later generates the actual key FDE key (Key<sub>RFS</sub>), it will check if the hash of PK<sub>KR</sub> is contained in the received TD Quote.
-
-    The boot will be stopped automatically after an export command is print.
+    During boot, FDE Agent retrieves a TD Quote, prints the TD Quote in an export command, and stops further boot.
     Example output:
     ```
     ---------------------------------------------------------
@@ -385,41 +620,51 @@ Note that the TD image using FDE currently only supports Ubuntu 24.04.
     qemu-system-x86_64: cpus are not resettable, terminating
     ```
 
-    Note that "panic=1" is used by the FDE Agent to kill the TD on every error.
-    This is an important security feature for production systems, but you might want to remove it during debug sessions.
+    > NOTE: "panic=1" is used by the FDE Agent to kill the TD on every error.
+    > This is an important security feature for production systems, but you might want to remove it during debug sessions.
 
-5. [On Preparation Host] Export TD Quote returned by last command:
+8. [**On Preparation Host**] Export TD Quote returned by last command:
     ```
     export QUOTE=<base64 encoded TD quote>
     ```
 
-6. [**On Preparation Host**] Register TD<sub>W</sub> at ITA KBS and retrieve the actual root file system encryption key (k<sub>RFS</sub>) and corresponding key id (ID<sub>K_RFS</sub>):
-
-    - Send the TD quote retrieved in the last step to the ITA KBS:
-
+9. [On Preparation Host] Generate root filesystem encryption key (k<sub>RFS</sub>) and corresponding key id (ID<sub>K_RFS</sub>).
+    - Generate root filesystem encryption key:
         ```
-        ./fde-binaries/target/release/fde-key-gen \
-            --pk-kr-path $PWD/data/pk_kr.pem \
-            --sk-kr-path $PWD/data/sk_kr.pem \
-            --kbs-env-file-path $KBS_ENV \
-            --kbs-url $KBS_URL \
-            --kbs-cert-path $KBS_CERT_PATH \
-            --quote-b64 $QUOTE
+        k_RFS=$(openssl rand -hex 64)
+        ```
+    - Generate corresponding key id (ID<sub>K_RFS</sub>):
+        ```
+        ID_K_RFS="keybroker/key/$(openssl rand -hex 32)"
         ```
 
-        In more detail, this script:
-        - retrieves ITA KBS credentials from the ITA KBS configuration file,
-        - uses credentials to get a bearer token for ITA KBS,
-        - extracts TD attributes `MRSEAM`, `MRSIGNERSEAM`, `SEAMSVN`, `MRTD`, `RTMR1`, `RTMR2`, and `RTMR3` from passed TD Quote,
-        - generates an ITA KBS key transfer policy based on the extracted TD attributes, which the ITA KBS later used to check the validity of a key retrieval request and triggers a key generation at ITA KBS using the TD attributes
-        - retrieves the file system encryption key (k<sub>RFS</sub>) and the corresponding key id (ID<sub>K_RFS</sub>) from ITA KBS and prints result.
-    - Export root file system encryption key (k<sub>RFS</sub>) and corresponding key id (ID<sub>K_RFS</sub>) returned by last command:
-        ```
-        export k_RFS="<hex encoded key>"
-        export ID_k_RFS="<key id>"
-        ```
+        - Optionally, use the following command to check the uniqueness of the key id (ID<sub>K_RFS</sub>) in KMS.
+            ```
+            docker exec -e VAULT_ADDR="http://127.0.0.1:8200" -e VAULT_TOKEN="$VAULT_ROOT_TOKEN" trustee-vault \
+                vault kv get -mount=keybroker $ID_K_RFS
+            ```
 
-7. [On Preparation Host] Re-encrypt TD<sub>W</sub> with the root file system encryption key (k<sub>RFS</sub>), and enroll corresponding key id (ID<sub>K_RFS</sub>) and KBS URL into OVMF:
+            The output `No value found at keybroker/<key-id>` indicates that the specified key id does not exist in the keybroker path and is therefore unused.
+            For any other result, generate another key id to prevent that an existing key is overwritten.
+
+10. [On Preparation Host] Send TD attributes from the TD Quote of TD<sub>W</sub>, the root filesystem encryption key (k<sub>RFS</sub>), and key id (ID<sub>K_RFS</sub>) to KBS:
+    ```
+    ./fde-binaries/target/release/fde-kbs-store-key \
+        --sk-kbs-admin-path $SK_KBS_ADMIN \
+        --kbs-url $KBS_URL \
+        --kbs-cert-path $KBS_CERT_PATH \
+        --quote-b64 $QUOTE \
+        --k-rfs-id $ID_K_RFS \
+        --k-rfs $k_RFS
+    ```
+
+    In more detail, this script:
+    - extracts TD attributes `MRSEAM`, `MRSIGNERSEAM`, `SEAMSVN`, `MRTD`, `RTMR1`, `RTMR2`, and `RTMR3` from passed TD Quote,
+    - uses SK<sub>KBS</sub> key for administrator access to Trustee KBS,
+    - based on the extracted TD attributes, generates an attestation policy for AS and a resource policy for KBS, which are later uses to validate key retrieval request,
+    - sends the root filesystem encryption key (k<sub>RFS</sub>) and corresponding key id (ID<sub>K_RFS</sub>) to KBS, which stores the key k<sub>RFS</sub> in the KMS with id ID<sub>K_RFS</sub>.
+
+11. [On Preparation Host] Re-encrypt TD<sub>W</sub> with the root filesystem encryption key (k<sub>RFS</sub>), and enroll the TD boot mode `TD_FDE_BOOT`, the key id ID<sub>K_RFS</sub>, and the KBS URL into OVMF:
     ```
     sudo tools/image/fde-encrypt_image.sh TD_FDE_BOOT \
         -p $PWD/tools/image/tdx-guest-ubuntu-24.04-encrypted.img \
@@ -427,12 +672,8 @@ Note that the TD image using FDE currently only supports Ubuntu 24.04.
         -d $PWD/data/tmp_k_rfs \
         -u $KBS_URL \
         -k $k_RFS \
-        -i $ID_k_RFS
+        -i $ID_K_RFS
     ```
-
-    In more detail, this script:
-    - re-encrypts the root filesystem partition using the actual encryption key (k<sub>RFS</sub>) retrieved from ITA KBS, replacing the initial dummy key,
-    - enrolls ITA KBS URL, the key id corresponding to root file system encryption key (ID<sub>K_RFS</sub>) stored in Vault, and the TD boot mode `TD_FDE_BOOT` into an OVMF image.
 
     Script will print the updated OVMF file path and the updated encrypted image path.
 
@@ -445,7 +686,7 @@ Note that the TD image using FDE currently only supports Ubuntu 24.04.
 
 ## Runtime Phase
 
-1. [On Workload Host] Boot TD<sub>W</sub> combined with the OVMF image `OVMF_TD_FDE_BOOT.fd`.
+1. [**On Workload Host**] Boot TD<sub>W</sub> combined with the OVMF image `OVMF_TD_FDE_BOOT.fd`.
 
     Make sure the respective TD image and OVMF binaries are copied to Workload Host and the paths match the following command:
     ```
@@ -455,28 +696,35 @@ Note that the TD image using FDE currently only supports Ubuntu 24.04.
     ```
 
     During the TD boot, the FDE Agent in initramfs performs the following steps:
-    - extracts ITA KBS URL and key id corresponding to root file system encryption key (ID<sub>K_RFS</sub>) from OVMF image,
-    - generates a random key pair (SK<sub>KR</sub>/PK<sub>KR</sub>) used for key retrieval from ITA KBS,
-    - generates TD Quote using PK<sub>KR</sub> as report data,
-    - sends TD Quote and PK<sub>KR</sub> to ITA KBS to request root file system encryption key (k<sub>RFS</sub>),
-    - receives Enc(k<sub>RFS</sub>) and Enc(k<sub>s</sub>) (see below),
-    - decrypts Enc(k<sub>s</sub>) with SK<sub>KR</sub>,
-    - decrypts Enc(k<sub>RFS</sub>) with k<sub>s</sub>,
-    - decrypts root file system using k<sub>RFS</sub>,
-    - continue boot process to root file system.
+    - extracts Trustee KBS URL and key id (ID<sub>K_RFS</sub>) corresponding to root filesystem encryption key (k<sub>RFS</sub>) from OVMF image,
+    - generates a random asymmetric key pair (SK<sub>TEE</sub>/PK<sub>TEE</sub>) used for key retrieval from Trustee KBS,
+    - sends an authentication request to Trustee KBS,
+    - receives a nonce-based challenge from from Trustee KBS,
+    - requests a TD Quote using a hash of the nonce and PK<sub>TEE</sub> as report data,
+    - sends the TD Quote, nonce, and PK<sub>TEE</sub> to Trustee KBS,
+    - receives an attestation token from Trustee KBS after quote verification by Attestation Service,
+    - requests resource ID<sub>K_RFS</sub> from Trustee KBS,
+    - receives encrypted root filesystem encryption key (k<sub>RFS</sub>) from Trustee KBS,
+    - decrypts the encrypted root filesystem encryption key (k<sub>RFS</sub>) using SK<sub>TEE</sub>,
+    - decrypts root filesystem partition using k<sub>RFS</sub>,
+    - securely erases k<sub>RFS</sub> from memory,
+    - continues boot process to root filesystem.
 
-    The ITA KBS performs the following steps:
-    - requests a nonce from ITA,
-    - sends TD Quote and nonce to ITA,
-    - receives verification result in the form of an attestation token from ITA,
-    - verifies that attestation token matches the key transfer policy defined before and was generated by valid ITA instance,
-    - requests k<sub>RFS</sub> from Vault,
-    - generates random, symmetric, wrapping key k<sub>s</sub>,
-    - encrypts k<sub>RFS</sub> with k<sub>s</sub> resulting in Enc(k<sub>RFS</sub>),
-    - encrypts k<sub>s</sub> with PK<sub>KR</sub> resulting in Enc(k<sub>s</sub>),
-    - forwards Enc(k<sub>RFS</sub>) and Enc(k<sub>s</sub>) to FDE agent.
+    The Trustee KBS performs the following steps:
+    - validates the authentication request from FDE Agent,
+    - generates a random nonce to ensure attestation freshness,
+    - returns the nonce and session_id to FDE Agent,
+    - receives TD Quote, nonce, and PK<sub>TEE</sub> from FDE Agent,
+    - verifies that the report data in TD Quote matches a hash of the received nonce and PK<sub>TEE</sub>
+    - forwards the TD Quote to Trustee's Attestation Service, which validates it against the attestation policy,
+    - receives an EAR attestation token from Attestation Service containing trust claims (hardware, configuration assessments),
+    - verifies the attestation token and evaluates the resource policy against the trust claims and TD measurements,
+    - returns attestation token to FDE Agent,
+    - retrieves the root filesystem encryption key (k<sub>RFS</sub>) from HashiCorp Vault at path matching ID<sub>K_RFS</sub>,
+    - encrypts k<sub>RFS</sub> with PK<sub>TEE</sub>,
+    - returns the encrypted key to FDE Agent.
 
-8. [On Workload Host] Verify the encryption status by running the below command in the booted TD<sub>W</sub>:
+2. [On Workload Host] Verify the encryption status by running the below command in the booted TD<sub>W</sub>:
     ```
     blkid
     ```
@@ -486,54 +734,106 @@ Note that the TD image using FDE currently only supports Ubuntu 24.04.
     /dev/vda1: UUID="57d673b1-0ad7-48fd-b442-e889786de176" LABEL="rootfs-enc_0da0ffcd" TYPE="crypto_LUKS"
     ```
 
-9. [On Preparation Host] Optionally, cleanup all the files and key generated during the preparation of your TD image.
+3. [**On Preparation Host**] Optionally, cleanup all the files and key generated during the preparation of your TD image and Trustee setup.
     ```
     rm -rf data/
+    rm -rf trustee/config-data/
     ```
 
 ## Limitations
+
 - The integrity of the actual workload is not protected.
 - The integrity of the components measured in RTMR0 are not protected.
-- Only QEMU-based boot using Canonical's `run_td_sh` is supported at the moment.
-    Note that this script does only support one TD at a time
+- Only QEMU-based boot using Canonical's `run_td.sh` is supported at the moment.
+    This script does only support one TD at a time.
+- Trustee KBS and HashiCorp Vault (KMS) currently don't communicate over a secure channel.
+- HashiCorp Vault will loose all root filesystem encryption keys on reboot as it runs in development environment.
+    Follow the instructions provided by HashiCorp for a production setup that is able to persistently store these keys.
 
 ## Troubleshooting
 
-- Key generation with `fde-key-gen` script fails with the following error:
+- After a machine reboot, Trustee KBS, Attestation service, and HashiCorp Vault should automatically restart.
+    Verify the services are running:
     ```
-    thread 'main' panicked at src/fde-key-gen.rs:69:60:
-    Failed to create root file key: Failed to create key, Error: 500
-    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+    docker ps --filter name=trustee
+    ```
+    You should see three running containers: `trustee-kbs`, `trustee-as`, and `trustee-vault`.
+
+- To restart the containers manually, run below commands:
+    ```
+    docker restart trustee-kbs
+    docker restart trustee-as
+    docker restart trustee-vault
     ```
 
-    In this case, the KBS log, which can be retrieved with `docker logs kbs`, will contain an error similar to the following:
+- After opening a new terminal session or after a machine reboot, move into directory of FDE project and setup configuration settings:
     ```
-    {"level":"debug","msg":"Create key request received","time":"2025-05-14T11:44:42Z","user":"f025d132-2d66-4008-8c56-ad9643d85b8e"}
-    {"error":"Put \"http://127.0.0.1:8200/v1/keybroker/9b5fe06b-ca70-4498-9b54-2a5cc844f894\": dial tcp 127.0.0.1:8200: connect: connection refused","level":"error","msg":"Key create failed","time":"2025-05-14T11:44:42Z","user":"f025d132-2d66-4008-8c56-ad9643d85b8e"}
-    {"level":"info","msg":"192.168.8.4 - - [14/May/2025:11:44:42 +0000] \"POST /kbs/v1/keys HTTP/1.1\" 500 38 \"\" \"\"","time":"2025-05-14T11:44:42Z"}
-    ```
-    This error indicates connection issues with HashiCorp Vault.
-    Make sure it is up and running by following the steps in the section `Setup HashiCorp Vault as a KMS`.
-
-- Key generation with `fde-key-gen` script fails with the following error:
-    ```
-    thread 'main' panicked at src/fde-key-gen.rs:75:10:
-    ./fde-binaries/target/release/fde-key-gen \
-    Failed to retrieve root file key: Get key request failed, Error: 401
-    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+    cd <folder of cloned repository>/full-disk-encryption/
+    source setup_config.sh
     ```
 
-    In this case, the KBS log, which can be retrieved with `docker logs kbs`, will contain an error similar to the following:
-
+- If you see certificate errors during FDE operations, verify the certificate path:
     ```
-    {"error":"Error while verifying the token: Failed to verify jwt token: Token is not valid yet","level": "error", "msg":"Failed to authenticate attestation-token", "time":"2025-05-12T04:24:47Z
-    "}
-    {"level": "info", "msg":"10.218.132.251 - - [12/May/2025:04:24:44 +0000] "POST /kbs/v1/keys/cf517adf-a13f-4897-a7f0-1a5dbd7ee148/transfer HTTP/2.0\" 401 58 \"\"\"\"", "time":"2025-05-12T04: 24:47Z"}
+    ls -la $KBS_CERT_PATH
     ```
-    This error indicates an issue with ITA KBS.
-    Make sure that you followed the instructions provided in the section `Setup ITA KBS as KBS`.
-    Also make sure that the NTP service is properly setup on the Preparation Host.
 
-- After a machine reboot, ITA KBS, HashiCorp Vault, and Intel PCCS might be shutdown.
+- Check logs of the services running to see any failure
+    ```
+    docker logs -f trustee-as --tail 50
+    docker logs -f trustee-kbs --tail 50
+    docker logs -f trustee-vault --tail 50
+    ```
+
+- If the Docker image build process for Trustee's Attestation Service or Trustee's Key Broker Service fails, please follow these steps:
+    1. Verify proxy-related environment variables (e.g., `http_proxy`, `https_proxy`, `no_proxy`) are correctly set.
+    2. Check Docker proxy settings at `/etc/systemd/system/docker.service.d/http-proxy.conf`
+
+- If you see an error like `chown: invalid group: 'username:username'` when running `fde-encrypt_image.sh`, this means your user doesn't have a matching group name.
+    Create a group with your username:
+    ```
+    sudo groupadd $(whoami)
+    sudo usermod -aG $(whoami) $(whoami)
+    ```
+    Verify the group:
+    ```
+    id
+    ```
+    It should show similar output as `uid=1000(username) gid=1000(username) groups=1000(username),...`.
+
+- After a machine reboot, HashiCorp Vault, and Intel PCCS might be shutdown.
     Please verify that these services are up and running.
-    If you want to reboot Vault with the old `VAULT_ROOT_TOKEN`, remember that it is present in the ITA KBS configuration file (`kbs.env`).
+    If you want to reboot Vault with the old `VAULT_ROOT_TOKEN`, remember that it is present in the setup configuration file (`<folder of cloned repository>/full-disk-encryption/setup_config.sh`).
+
+- Storing key with `fde-kbs-store-key` fails with following error:
+    ```
+    thread 'main' (3391207) panicked at src/fde-kbs-store-key.rs:73:77:
+    Failed to create root file key: Failed to store root filesystem encryption key, Status: 401 Unauthorized, Error: {"type":"https://github.com/confidential-containers/kbs/errors/PluginInternalError","detail":"Plugin internal error"}
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+    ```
+    In this case, the KBS log will contain an error similar to the following:
+    ```
+    [<date and time> DEBUG reqwest::connect] proxy(http://proxy.server.com:911/) intercepts 'http://<system-ip>:8200/'
+    [<date and time> ERROR kbs::error] PluginInternalError { source: Failed to write secret to Vault
+
+        Caused by:
+            0: An error occurred with the request
+            1: Server returned error }
+    ```
+    This error indicates communication issues between Trustee KBS and HashiCorp Vault.
+    Make sure all proxy-related environment variables (e.g., `http_proxy`, `https_proxy`, `no_proxy`) are correctly set.
+    Include system IP in `no_proxy` environment variable and start Trustee KBS using `docker run` command provided in [Setup Trustee's Key Broker Service as KBS](#setup-trustees-key-broker-service-as-kbs).
+
+- Storing key with `fde-kbs-store-key` fails with following error:
+    ```
+    thread 'main' (938774) panicked at src/fde-kbs-store-key.rs:72:68:
+    Failed to store root filesystem encryption key in KBS: Build KBS http client failed: reqwest::Error { kind: Builder, source: InvalidCertificate(BadEncoding) }
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+    ```
+    The error `InvalidCertificate` indicates that the certificate provided to TD using initramfs is invalid.
+
+- When starting Trustee's Attestation Service or KBS, the following error occurs:
+    ```
+    docker: Error response from daemon: failed to set up container networking: driver failed programming external connectivity on endpoint trustee-kbs (4a6fffe746b4611c97b04a989c94fd7a20a2875be822bd6855d1c4ff583129cc): failed to bind host port 0.0.0.0:8200/tcp: address already in use
+    ```
+    This means that port 8200 is already being used by another service.
+    Please ensure that the port specified in your command is available.

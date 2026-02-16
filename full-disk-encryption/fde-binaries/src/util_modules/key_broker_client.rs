@@ -2,46 +2,37 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 use anyhow::{anyhow, Result};
-use reqwest::header::{HeaderMap, ACCEPT, CONTENT_TYPE};
-use reqwest::blocking::Client;
-use reqwest::tls::Version;
-use rsa::RsaPrivateKey;
-use serde_json::Value;
-use base64::prelude::*;
-
-use aes_gcm::aead::{generic_array::GenericArray, Aead};
-use aes_gcm::{Aes256Gcm, KeyInit};
-use rsa::sha2::Sha256;
-use rsa::Oaep;
-use std::fs::File;
-use std::io::prelude::*;
-use std::io::{BufRead, BufReader};
+use std::fs;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
+use jwt_simple::prelude::{Claims, Duration, Ed25519KeyPair, EdDSAKeyPairLike};
+use kbs_protocol::ResourceUri;
+use kbs_protocol::evidence_provider::NativeEvidenceProvider;
+use kbs_protocol::KbsClientBuilder;
+use kbs_protocol::KbsClientCapabilities;
+use serde::Serialize;
 
 use crate::quote::Quote;
+use crate::disk::K_RFS_BIT_LENGTH;
 
-use super::disk::{
-    K_RFS_BIT_LENGTH,
-    K_RFS_ALGO
-};
-
-pub trait KBS {
-    fn create_k_rfs(&self, bearer_token: &str, quote: &Quote) -> Result<String>;
-    fn retrieve_k_rfs(&self, req: String, sk_kr: RsaPrivateKey, id_k_rfs: String) -> Result<Vec<u8>>;
+pub trait KBSClient {
+    // Send root filesystem encryption key to KBS, which will use KMS for storage.
+    fn store_k_rfs(&self, k_rfs: &str, sk_kbs_admin: &str, quote: &Quote, k_rfs_id: &str) -> Result<()>;
+    // Retrieve root filesystem encryption key from KBS.
+    fn retrieve_k_rfs(&self, kbs_k_rfs_id: String) -> impl std::future::Future<Output = Result<Vec<u8>>> + Send;
 }
 
-pub struct ItaKbs {
+pub struct TrusteeKbsClient {
     kbs_url: String,
-    kbs_cert: reqwest::Certificate,
+    kbs_cert: String,
 }
 
-/// Parameters for key transfer policy creation
+/// Parameters for resource policy creation.
 ///
-/// These parameters are used to create a key transfer policy in the ITA KBS.
+/// These parameters are used to create a resource policy in the Trustee KBS.
 /// The struct contains all measurement values from the quote that are required for attestation-based key release.
 #[derive(Debug, Clone)]
-struct KeyTransferPolicyParams {
-    /// Authorization token for KBS API access
-    bearer_token: String,
+struct TrusteeResourcePolicy {
     /// Measurement of Intel TDX Module
     mrseam: String,
     /// The measurement of the signing key used for the Intel TDX Module.
@@ -58,8 +49,19 @@ struct KeyTransferPolicyParams {
     rtmr3: String,
 }
 
-impl ItaKbs {
-    /// Creates a new instance of an ITA KBS.
+/// Request body for setting a resource policy in KBS.
+///
+/// This struct is used to set resource policy that controls access to resources after attestation succeeds.
+#[derive(Clone, Serialize)]
+struct ResourcePolicyRequest {
+    // The actual policy content as a string.
+    pub policy: String,
+}
+
+impl TrusteeKbsClient {
+    const KBS_URL_PREFIX: &str = "kbs/v0";
+
+    /// Creates a new instance of a Trustee KBS Client.
     ///
     /// # Parameters
     ///
@@ -68,188 +70,298 @@ impl ItaKbs {
     ///
     /// # Returns
     ///
-    /// * `Result<Self>` - A result containing the new instance of an ITA KBS.
+    /// * `Result<Self>` - A result containing the new instance of a Trustee KBS Client.
     pub fn new(kbs_url: String, kbs_cert_path: String) -> Result<Self> {
-        // Try to open the KBS certificate file.
-        let mut kbs_cert = File::open(kbs_cert_path.clone())
-            .map_err(|_| anyhow!("Error opening KBS certificate file '{}'", kbs_cert_path.clone()))?;
+        // Try to read KBS certificate file.
+        let kbs_cert = fs::read_to_string(&kbs_cert_path)
+            .map_err(|e| anyhow!(
+                "Failed to read KBS certificate file '{}': {}",
+                kbs_cert_path, e
+            ))?;
 
-        // Try to read the content into buffer.
-        let mut buffer = Vec::new();
-        kbs_cert.read_to_end(&mut buffer)
-            .map_err(|_| anyhow!("Error reading file '{}'", kbs_cert_path.clone()))?;
-
-        // Try to parse the certificate from PEM format.
-        let kbs_cert = reqwest::Certificate::from_pem(&buffer)
-            .map_err(|_| anyhow!("Error parsing certificate from file '{}'", kbs_cert_path.clone()))?;
-
-        Ok(Self {
-            kbs_url,
-            kbs_cert,
-        })
+        Ok(Self { kbs_url, kbs_cert })
     }
 
-    /// Reads the admin username and password from a configuration file.
+    /// Create a resource policy for Trustee KBS.
     ///
     /// # Parameters
     ///
-    /// - `kbs_env_file_path`: The path to the ITA KBS configuration file
+    /// - `sk_kbs_admin`: Private key used for administrator access to KBS (in PEM format).
+    /// - `params`: TrusteeResourcePolicy struct containing measurement values from the quote.
+    /// - `k_rfs_id`: ID for the root filesystem encryption key resource in KBS.
     ///
     /// # Returns
     ///
-    /// * `Result<(String, String)>` - A result containing a tuple with the username and password.
-    pub fn retrieve_credentials(kbs_env_file_path: &str) -> Result<(String, String)> {
-        // Read KBS enviornment file.
-        let kbs_env_file = File::open(kbs_env_file_path)
-            .map_err(|_| anyhow!("Failed to open KBS env file: {}", kbs_env_file_path))?;
-        let reader = BufReader::new(kbs_env_file);
+    /// * `Result<()>` - A result indicating success or failure.
+    fn create_trustee_resource_policy(&self, sk_kbs_admin: &str, params: TrusteeResourcePolicy, k_rfs_id: &str) -> Result<()> {
+        // Concat resource with key id to check the resource path. e.g. "resource/keybroker/key/<key_id>"
+        let key_id = format!("resource/{}", k_rfs_id);
+        // Create policy in rego format
+        let policy_content = format!(
+            r#"package policy
+                import rego.v1
+                default allow = false
 
-        // Read username and password from the KBS enviornment file.
-        let mut username = String::new();
-        let mut password = String::new();
-        for line in reader.lines() {
-            let line = line?;
-            if let Some((key, value)) = line.split_once('=') {
-                match key.trim() {
-                    "ADMIN_USERNAME" => username = value.trim().to_string(),
-                    "ADMIN_PASSWORD" => password = value.trim().to_string(),
-                    _ => {}
-                }
+                allow if {{
+                    data["resource-path"] == "{}"
+
+                    input["submods"]["cpu0"]["ear.trustworthiness-vector"]["hardware"] == 3
+                    input["submods"]["cpu0"]["ear.trustworthiness-vector"]["configuration"] == 3
+
+                    input["submods"]["cpu0"]["ear.veraison.annotated-evidence"]["tdx"]["quote"]["body"]["rtmr_1"] == "{}"
+                    input["submods"]["cpu0"]["ear.veraison.annotated-evidence"]["tdx"]["quote"]["body"]["rtmr_2"] == "{}"
+                    input["submods"]["cpu0"]["ear.veraison.annotated-evidence"]["tdx"]["quote"]["body"]["rtmr_3"] == "{}"
+                    input["submods"]["cpu0"]["ear.veraison.annotated-evidence"]["tdx"]["quote"]["body"]["mr_seam"] == "{}"
+                    input["submods"]["cpu0"]["ear.veraison.annotated-evidence"]["tdx"]["quote"]["body"]["mrsigner_seam"] == "{}"
+                    input["submods"]["cpu0"]["ear.veraison.annotated-evidence"]["tdx"]["quote"]["body"]["mr_td"] == "{}"
+                    input["submods"]["cpu0"]["ear.veraison.annotated-evidence"]["tdx"]["quote"]["body"]["tcb_svn"] == "{}"
+                }}
+                "#,
+            key_id,
+            params.rtmr1,
+            params.rtmr2,
+            params.rtmr3,
+            params.mrseam,
+            params.mrsignerseam,
+            params.mrtd,
+            params.seamsvn
+        );
+
+        let kbs_admin_key_pair = Ed25519KeyPair::from_pem(sk_kbs_admin)?;
+        let claims = Claims::create(Duration::from_hours(2));
+        let token = kbs_admin_key_pair.sign(claims)?;
+
+        // Build HTTPs client for connection to KBS.
+        let http_client = self.build_kbs_https_client()?;
+
+        // Prepare API URL for setting a policy in the Key Broker Service.
+        let set_policy_url = format!("{}/{}/resource-policy", self.kbs_url, Self::KBS_URL_PREFIX);
+
+        // Prepare request body for setting a policy in the Key Broker Service.
+        let policy_data = ResourcePolicyRequest {
+            policy: URL_SAFE_NO_PAD.encode(policy_content.as_bytes()), // Base64 URL-safe encoding without padding
+        };
+
+        // Send request.
+        let res = http_client
+            .post(set_policy_url)
+            .header("Content-Type", "application/json")
+            .bearer_auth(token)
+            .json(&policy_data)
+            .send()?;
+
+        match res.status() {
+            reqwest::StatusCode::OK => {
+                println!("Successfully set resource policy in Trustee KBS");
+                Ok(())
             }
+            status_code => Err(anyhow!(
+                "Failed to create resource policy, Status: {}, Error: {}",
+                status_code,
+                res.text()?
+            )),
         }
-
-        if username.is_empty() || password.is_empty() {
-            return Err(anyhow!("Failed to read ADMIN_USERNAME or ADMIN_PASSWORD from config"));
-        }
-
-        Ok((username, password))
     }
 
-    /// Retrieves a bearer token from the ITA KBS using the provided username and password.
+    /// Create an attestation policy for Trustee KBS.
     ///
     /// # Parameters
     ///
-    /// - `username`: The admin username.
-    /// - `password`: The admin password.
+    /// - `sk_kbs_admin`: Private key used for administrator access to KBS (in PEM format).
     ///
     /// # Returns
     ///
-    /// * `Result<String>` - A result containing the bearer token.
-    pub fn get_bearer_token(&self, username: &str, password: &str) -> Result<String> {
-        // Prepare request.
-        let tls_client = self.default_tls_client();
-        let req_url = format!("{}/kbs/v1/token", self.kbs_url);
-        let mut req_headers = HeaderMap::new();
-        req_headers.insert(ACCEPT, "application/jwt".parse()?);
-        req_headers.insert(CONTENT_TYPE, "application/json".parse()?);
-        let req_body = format!(
-            r#"{{"username": "{}", "password": "{}"}}"#,
-            username, password
+    /// * `Result<()>` - A result indicating success or failure.
+    fn create_trustee_attestation_policy(&self, sk_kbs_admin: &str) -> Result<()> {
+
+        // Create policy in rego format
+        let policy_content = r#"package policy
+                import rego.v1
+
+                default hardware := 97
+                default configuration := 36
+
+                trust_claims := {
+                    "hardware": hardware,
+                    "configuration": configuration,
+                }
+
+                hardware := 3 if {
+                    input.tdx
+                    input.tdx.quote.header.tee_type == "81000000"
+                    input.tdx.quote.header.vendor_id == "939a7233f79c4ca9940a0db3957f0607"
+                    input.tdx.tcb_status == "UpToDate"
+                    input.tdx.collateral_expiration_status == "0"
+                }
+
+                configuration := 3 if {
+                    input.tdx
+                    input.tdx.td_attributes.debug == false
+                }"#.to_string();
+
+        let kbs_admin_key_pair = Ed25519KeyPair::from_pem(sk_kbs_admin)?;
+        let claims = Claims::create(Duration::from_hours(2));
+        let token = kbs_admin_key_pair.sign(claims)?;
+
+        // Build HTTPs client for connection to KBS.
+        let http_client = self.build_kbs_https_client()?;
+
+        // Prepare API URL for setting a policy in the Key Broker Service.
+        let set_policy_url = format!("{}/{}/attestation-policy", self.kbs_url, Self::KBS_URL_PREFIX);
+
+        // Prepare request body for setting a policy in the Key Broker Service.
+        let policy_data = format!(
+            r#"{{"type": "{}", "policy": "{}", "policy_id": "{}"}}"#,
+            "rego",
+            URL_SAFE_NO_PAD.encode(policy_content.as_bytes()), // Base64 URL-safe encoding without padding
+            "default_cpu"
+            );
+
+        // Send request.
+        let res = http_client
+            .post(set_policy_url)
+            .header("Content-Type", "application/json")
+            .bearer_auth(token)
+            .body(policy_data)
+            .send()?;
+
+        match res.status() {
+            reqwest::StatusCode::OK => {
+                println!("Successfully set attestation policy in Trustee KBS");
+                Ok(())
+            }
+            status_code => Err(anyhow!(
+                "Failed to create attestation policy, Status: {}, Error: {}",
+                status_code,
+                res.text()?
+            )),
+        }
+    }
+
+    /// Send root filesystem encryption key (k_rfs) to Trustee KBS, which will store it at the location k_rfs_id in the KMS.
+    /// Use private key used for administrator access to KBS for this operation.
+    ///
+    /// # Parameters
+    ///
+    /// - `k_rfs`: The root filesystem encryption key as a hex string.
+    /// - `sk_kbs_admin`: Private key used for administrator access to KBS (in PEM format).
+    /// - `k_rfs_id`: ID for the root filesystem encryption key resource in KBS.
+    ///
+    /// # Returns
+    ///
+    /// * `Result<()>` - A result indicating success or failure.
+    fn set_k_rfs(&self, k_rfs: &str, sk_kbs_admin: &str, k_rfs_id: &str) -> Result<()> {
+        // Create JWT token for administrator access to KBS.
+        let kbs_admin_key_pair = Ed25519KeyPair::from_pem(sk_kbs_admin)?;
+        let claims = Claims::create(Duration::from_hours(2));
+        let token = kbs_admin_key_pair.sign(claims)?;
+
+        // Build HTTPs client for connection to KBS.
+        let http_client = self.build_kbs_https_client()?;
+
+        // Construct URL used to set a resource in KBS.
+        let resource_url = format!(
+            "{}/{}/resource/{}",
+            &self.kbs_url,
+            Self::KBS_URL_PREFIX,
+            k_rfs_id
         );
 
         // Send request.
-        let resp = tls_client
-            .post(&req_url)
-            .headers(req_headers)
-            .body(req_body)
-            .send()
-            .expect("Request failed");
+        let res = http_client
+            .post(resource_url)
+            .header("Content-Type", "application/octet-stream")
+            .bearer_auth(token)
+            .body(k_rfs.to_string())
+            .send()?;
 
-        if resp.status() != 200 {
-            return Err(anyhow!(
-                "Failed to retrieve bearer token, Error: {:?}",
-                resp.status()
-            ));
+        match res.status() {
+            reqwest::StatusCode::OK => {
+               println!("Successfully set k_rfs resource in Trustee KBS at location: {}", k_rfs_id);
+               Ok(())
+            },
+            status_code => Err(anyhow!(
+                "Failed to store root filesystem encryption key, Status: {}, Error: {}",
+                status_code,
+                res.text()?
+            )),
         }
-
-        // Read bearer token from response.
-        let bearer_token: String = resp.text().expect("Failed to read bearer token");
-        Ok(bearer_token)
     }
 
-    /// Creates a default TLS client, which expects a connection using the provided ITA KBS cert.
+    /// Get secret resources with attestation
+    ///
+    /// This method uses the KBS protocol to perform remote attestation and retrieve
+    /// a secret resource after successful verification.
+    ///
+    /// # Parameters
+    ///
+    /// - `resource_id`: Resource id, format must be `<top>/<middle>/<tail>`, e.g. `alice/key/example`.
     ///
     /// # Returns
     ///
-    /// * `Result<Client>` - A result containing the configured client.
-    ///
-    /// # Errors
-    ///
-    /// This function will return an error if:
-    /// - The certificate file cannot be read.
-    /// - The certificate cannot be parsed from the PEM format.
-    fn default_tls_client(&self) -> Client {
-        // Setup a TLS client that enforces the expected KBS certificate.
-        // We exclude the build in root certificates to ensure that only the provided KBS certificate is accepted.
-        Client::builder()
-            .use_rustls_tls()
-            .tls_built_in_root_certs(false)
-            .add_root_certificate(self.kbs_cert.clone())
-            .min_tls_version(Version::TLS_1_2)
-            .build()
-            .expect("Failed to build client")
+    /// * `Result<Vec<u8>>` - A result containing the resource bytes retrieved from the KBS.
+    async fn get_resource_with_attestation(&self, resource_id: &str) -> Result<Vec<u8>> {
+        // Build KBS client with evidence provider
+        let evidence_provider = Box::new(NativeEvidenceProvider::new()?);
+
+        // Enforce the usage of the expected KBS certificate.
+        let client_builder = KbsClientBuilder::with_evidence_provider(evidence_provider, &self.kbs_url)
+                .add_kbs_cert(&self.kbs_cert);
+
+        let mut client = client_builder.build()?;
+
+        // ResourceUri is the identification information of all resources that need to be obtained from `get_resource` endpoint.
+        // Convert resource id to ResourceUri format.
+        let resource_kbs_uri = format!("kbs:///{resource_id}");
+        let resource_uri = ResourceUri::try_from(resource_kbs_uri.as_str())
+            .map_err(|e| anyhow!("Invalid resource URI '{}': {}", resource_kbs_uri, e))?;
+
+        // Get resource from KBS in a complex process:
+        // -  generate a random asymmetric key pair SK_TEE/PK_TEE used for key retrieval from Trustee KBS,
+        // -  send an authentication request to Trustee KBS,
+        // -  receive a nonce-based challenge from from Trustee KBS,
+        // -  request a TD Quote using a hash of the nonce and PK_TEE as report data,
+        // -  send the TD Quote, nonce, and PK_TEE to Trustee KBS,
+        // -  receive an attestation token from Trustee KBS after quote verification by Attestation Service,
+        // -  request resource from Trustee KBS using its ID,
+        // -  receive encrypted resource from Trustee KBS,
+        // -  decrypt the encrypted resource using SK_TEE.
+        let resource_bytes = client.get_resource(resource_uri).await?;
+        Ok(resource_bytes)
     }
 
-    fn create_key_transfer_policy(&self, params: KeyTransferPolicyParams) -> Result<String> {
-        // Create key transfer policy creation request.
-        let req_url = format!("{}/kbs/v1/key-transfer-policies", self.kbs_url);
-        let mut req_headers = HeaderMap::new();
-        req_headers.insert(ACCEPT, "application/json".parse()?);
-        req_headers.insert(CONTENT_TYPE, "application/json".parse()?);
-        req_headers.insert("Authorization", format!("Bearer {}", params.bearer_token).parse()?);
-        let req_body = format!(
-            r#"{{
-                "attestation_type": "TDX",
-                "tdx": {{
-                    "attributes": {{
-                        "mrseam": ["{}"],
-                        "mrsignerseam": ["{}"],
-                        "seamsvn": {},
-                        "mrtd": ["{}"],
-                        "rtmr1": "{}",
-                        "rtmr2": "{}",
-                        "rtmr3": "{}",
-                        "enforce_tcb_upto_date": false
-                    }}
-                }}
-            }}"#,
-            params.mrseam,
-            params.mrsignerseam,
-            params.seamsvn,
-            params.mrtd,
-            params.rtmr1,
-            params.rtmr2,
-            params.rtmr3
-        );
+    /// Build HTTPS client, which enforces the usage of the expected KBS certificate.
+    ///
+    /// # Returns
+    ///
+    /// * `Result<reqwest::blocking::Client>` - A result containing the configured client.
+    fn build_kbs_https_client(&self) -> Result<reqwest::blocking::Client> {
+        let cert = reqwest::Certificate::from_pem(self.kbs_cert.as_bytes())?;
 
-        // Send key transfer policy creation request.
-        let tls_client = self.default_tls_client();
-        let resp = tls_client
-            .post(&req_url)
-            .headers(req_headers)
-            .body(req_body)
-            .send()
-            .expect("Request failed");
-        if resp.status() != 201 {
-            return Err(anyhow!(
-                "Failed to create key transfer policy, Error: {:?}",
-                resp.status()
-            ));
-        }
-
-        // Read ID of created key transfer policy.
-        let res_json: Value = resp.json().expect("Failed to parse response");
-        let policy_id = res_json["id"]
-            .as_str()
-            .ok_or_else(|| anyhow!("Failed to parse policy ID from response"))?
-            .to_string();
-
-        Ok(policy_id)
+        // Build a TLS client.
+        // Enforce the usage of the expected KBS certificate.
+        reqwest::blocking::Client::builder()
+            .user_agent(format!("fde-agent/{}", env!("CARGO_PKG_VERSION")))
+            .add_root_certificate(cert)
+            .build()
+            .map_err(|e| anyhow!("Build KBS http client failed: {:?}", e))
     }
 }
 
-impl KBS for ItaKbs {
-    fn create_k_rfs(&self, bearer_token: &str, quote: &Quote) -> Result<String> {
+impl KBSClient for TrusteeKbsClient {
+    /// Send root filesystem encryption key to KBS, which will use KMS for storage.
+    ///
+    /// # Parameters
+    ///
+    /// - `k_rfs`: The root filesystem encryption key as a hex string.
+    /// - `sk_kbs_admin`: Private key used for administrator access to KBS (in PEM format).
+    /// - `quote`: The TD quote used for attestation.
+    /// - `k_rfs_id`: ID for the root filesystem encryption key resource in KBS.
+    ///
+    /// # Returns
+    ///
+    /// * `Result<()>` - A result indicating success or failure.
+    fn store_k_rfs(&self, k_rfs: &str, sk_kbs_admin: &str, quote: &Quote, k_rfs_id: &str) -> Result<()> {
         // Extract values from the Quote object
         let (mrseam, mrsignerseam, seamsvn, mrtd, rtmr1, rtmr2, rtmr3) = match quote {
             Quote::V4(q) => (
@@ -263,9 +375,8 @@ impl KBS for ItaKbs {
             ),
         };
 
-        // Create key transfer policy and retrieve its ID.
-        let policy_params = KeyTransferPolicyParams {
-            bearer_token: bearer_token.to_string(),
+        // Construct parameters to set resource policy.
+        let trustee_resource_policy = TrusteeResourcePolicy {
             mrseam,
             mrsignerseam,
             seamsvn,
@@ -274,105 +385,48 @@ impl KBS for ItaKbs {
             rtmr2,
             rtmr3,
         };
-        let policy_id = self.create_key_transfer_policy(policy_params)
-            .expect("Cannot create key transfer policy");
 
-        // Trigger generation of root file system key (k_rfs).
-        let tls_client = self.default_tls_client();
-        let req_url = format!("{}/kbs/v1/keys", self.kbs_url);
-        let mut req_headers = HeaderMap::new();
-        req_headers.insert(ACCEPT, "application/json".parse()?);
-        req_headers.insert(CONTENT_TYPE, "application/json".parse()?);
-        req_headers.insert("Authorization", format!("Bearer {}", bearer_token).parse()?);
-        let req_body = format!(
-            r#"{{
-                "key_information": {{ "algorithm":"{}", "key_length":{} }},
-                "transfer_policy_id" : "{}"
-            }}"#,
-            K_RFS_ALGO,
-            K_RFS_BIT_LENGTH,
-            policy_id
-        );
+        // Create a resource policy for Trustee KBS.
+        self.create_trustee_resource_policy(sk_kbs_admin, trustee_resource_policy, k_rfs_id)?;
 
-        // Send request.
-        let resp = tls_client
-            .post(&req_url)
-            .headers(req_headers)
-            .body(req_body)
-            .send()
-            .expect("Request failed");
+        // Create an attestation policy for Trustee KBS.
+        self.create_trustee_attestation_policy(sk_kbs_admin)?;
 
-        if resp.status() != 201 {
-            return Err(anyhow!(
-                "Failed to create key, Error: {:?}",
-                resp.status()
-            ));
-        }
+        // Store root filesystem encryption key in Trustee KBS.
+        self.set_k_rfs(k_rfs, sk_kbs_admin, k_rfs_id)?;
 
-        // Read ID of root file system key (k_rfs).
-        let res_json: Value = resp.json().expect("Failed to parse response");
-        let k_rfs_id = res_json["id"]
-            .as_str()
-            .expect("Failed to parse key ID from response")
-            .to_string();
-
-        Ok(k_rfs_id)
+        Ok(())
     }
 
-    fn retrieve_k_rfs(&self, req_body: String, sk_kr: RsaPrivateKey, id_k_rfs: String) -> Result<Vec<u8>> {
-        // Create fde key retrieval request.
-        let tls_client = self.default_tls_client();
-        let req_url = format!("{}/kbs/v1/keys/{}/transfer", &self.kbs_url, id_k_rfs);
-        let mut req_headers = HeaderMap::new();
-        req_headers.insert(ACCEPT, "application/json".parse()?);
-        req_headers.insert(CONTENT_TYPE, "application/json".parse()?);
-        req_headers.insert("Attestation-type", "TDX".parse()?);
+    /// Retrieve root filesystem encryption key (k_rfs) after successful attestation.
+    ///
+    /// # Parameters
+    ///
+    /// - `kbs_k_rfs_id`: ID for the root filesystem encryption key resource in KBS.
+    ///
+    /// # Returns
+    ///
+    /// * `Result<Vec<u8>>` - A result containing the retrieved root filesystem encryption key (k_rfs) as bytes.
+    async fn retrieve_k_rfs(&self, kbs_k_rfs_id: String) -> Result<Vec<u8>> {
+        // Request root filesystem encryption key (k_rfs).
+        let resource_bytes = self.get_resource_with_attestation(&kbs_k_rfs_id).await?;
 
-        // Send fde key retrieval request.
-        let resp = tls_client
-            .post(&req_url)
-            .headers(req_headers)
-            .body(req_body)
-            .send()
-            .expect("Request failed");
+        // Convert received root filesystem encryption key from bytes to String.
+        let hex_string = String::from_utf8(resource_bytes)
+            .map_err(|e| anyhow!("Retrieved resource is not valid UTF-8: {}", e))?;
 
-        if resp.status() != 200 {
+        let k_rfs = hex::decode(hex_string.trim()).map_err(|e| anyhow!("Retrieved key is not valid hex: {}", e))?;
+
+        // Check for expected key length.
+        if k_rfs.len() != (K_RFS_BIT_LENGTH / 8) {
             return Err(anyhow!(
-                "Get key request failed, Error: {:?}",
-                resp.status()
+                "Length of k_rfs is not as expected: got {}, expected {}",
+                k_rfs.len(),
+                K_RFS_BIT_LENGTH / 8
             ));
         }
 
-        // Read wrapped keys from response.
-        let res_json: Value = resp.json().expect("Failed to parse response");
-        let wrapped_k_rfs = BASE64_STANDARD.decode(res_json["wrapped_key"].as_str().unwrap())?;
-        let wrapped_k_rfs_bytes = wrapped_k_rfs.as_slice();
-        let wrapped_k_swk = BASE64_STANDARD.decode(res_json["wrapped_swk"].as_str().unwrap())?;
-        let wrapped_k_swk_bytes = wrapped_k_swk.as_slice();
-
-        // Decrypt the wrapped key SWK using the private key SK_KR.
-        let padding = Oaep::new::<Sha256>();
-        let k_swk = sk_kr
-            .decrypt(padding, wrapped_k_swk_bytes)
-            .expect("Failed to decrypt wrapped k_swk");
-        let k_swk_bytes = GenericArray::from_slice(&k_swk);
-
-        // Decrypt the wrapped key RFS using the key SWK.
-        const NONCE_LEN: usize = 12;
-        const KBS_PADDING: usize = 12;
-        let cipher = Aes256Gcm::new(k_swk_bytes);
-        let wrapped_k_rfs_nonce = GenericArray::from_slice(&wrapped_k_rfs_bytes[KBS_PADDING..KBS_PADDING+NONCE_LEN]);
-        let wrapped_k_rfs_ciphertext = &wrapped_k_rfs_bytes[KBS_PADDING+NONCE_LEN..];
-        let k_rfs = cipher
-            .decrypt(wrapped_k_rfs_nonce, wrapped_k_rfs_ciphertext)
-            .expect("Failed to decrypt wrapped k_rfs");
-
-        // Check for expected key length.
-        let k_rfs_bits = k_rfs.len() * std::mem::size_of::<u8>() * 8;
-        if k_rfs_bits != K_RFS_BIT_LENGTH {
-            panic!("Length of k_rfs is not as expected");
-        }
-
+        println!("Successfully retrieved k_rfs from Trustee KBS");
         Ok(k_rfs)
     }
 }

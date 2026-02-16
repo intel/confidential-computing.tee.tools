@@ -4,5 +4,4 @@
 pub mod key_broker_client;
 pub mod ovmf_var;
 pub mod quote;
-pub mod rsa_ext;
 pub mod disk;

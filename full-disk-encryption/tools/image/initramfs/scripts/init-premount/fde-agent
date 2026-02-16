@@ -1,6 +1,6 @@
 #!/bin/sh
 
-# Copyright (C) 2025 Intel Corporation
+# Copyright (C) 2025 - 2026 Intel Corporation
 # SPDX-License-Identifier: BSD-3-Clause
 
 PREREQ="cloud-initramfs-dyn-netconf"
@@ -25,6 +25,16 @@ panic=1
 
 # Mount efivars to get EFI variables
 mount -t efivarfs efivarfs /sys/firmware/efi/efivars
+
+# Mount configfs for potential use by tdx-attest library.
+# The library will try TSM first, then automatically fall back to vsock if TSM unavailable.
+mkdir -p /sys/kernel/config
+mount -t configfs none /sys/kernel/config
+
+# Verify that the TSM report path exists; required for attestation. Panic if missing.
+if [ ! -e /sys/kernel/config/tsm/report ]; then
+    panic "TSM report path /sys/kernel/config/tsm/report not found"
+fi
 
 # Configure the network
 configure_networking

@@ -1,4 +1,4 @@
-// Copyright (C) 2025 Intel Corporation
+// Copyright (C) 2025 - 2026 Intel Corporation
 // SPDX-License-Identifier: BSD-3-Clause
 
 use anyhow::{anyhow, Ok, Result};
@@ -194,15 +194,15 @@ impl QuoteV4 {
     ///
     /// # Returns
     ///
-    /// This function returns a `String` representing the SEAM version
+    /// Returns a hex string representation of the SEAM version (e.g., "030000000000000000000000000000000").
+    /// This format is required by Trustee attestation policies.
     pub fn get_intel_tdx_module_version(&self) -> String {
         let tcb_svn = &self.report_body.tee_tcb_svn.tcb_svn;
 
-        let seam_minor_version = tcb_svn[0];
-        let seam_major_version = tcb_svn[1];
+        // Convert TCB SVN bytes to hex string format required by Trustee
+        let seam_version: String = tcb_svn.iter().map(|byte| format!("{:02x}", byte)).collect();
 
-        let seam_version = (seam_major_version as u16 * 256) + seam_minor_version as u16;
-        seam_version.to_string()
+        seam_version
     }
 }
 
@@ -230,12 +230,17 @@ impl Quote {
     ///
     /// This function will return an error if the attestation library fails to generate the quote.
     /// The error message will indicate that the quote retrieval has failed.
-    pub fn retrieve_quote(tdx_report_data: &tdx_attest_rs::tdx_report_data_t) -> Result<Self> {
+    pub fn retrieve_quote(tdx_report_data: Option<&tdx_attest_rs::tdx_report_data_t>) -> Result<Self> {
+        // If provided, use passed report data; otherwise, generate empty report data.
+        let tdx_report_data_ref = match tdx_report_data {
+            Some(p) => Some(p),
+            None => Some(&tdx_attest_rs::tdx_report_data_t { d: [0u8; 64] }),
+        };
         // Retrieve quote with provided report data.
         // A list of attestation key IDs is not provided resulting in the usage of the default attestation key ID, which will be returned in selected_att_key_id.
         let mut selected_att_key_id = tdx_attest_rs::tdx_uuid_t { d: [0; 16usize] };
         let (result, quote) = tdx_attest_rs::tdx_att_get_quote(
-            Some(tdx_report_data),
+            tdx_report_data_ref,
             None,
             Some(&mut selected_att_key_id),
             0,

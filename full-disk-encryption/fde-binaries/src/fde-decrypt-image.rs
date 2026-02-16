@@ -4,13 +4,11 @@
 use anyhow::{anyhow, Ok, Result};
 use clap::Parser;
 
-use rsa::{RsaPrivateKey, RsaPublicKey, rand_core::OsRng};
-use zeroize::Zeroize;
+use zeroize::Zeroizing;
 use utils::{
-    key_broker_client::{KBS, ItaKbs},
-    ovmf_var::{OvmfParamsBootMode, OvmfParamsGetQuote, OvmfParamsFdeBoot},
+    key_broker_client::{KBSClient, TrusteeKbsClient},
+    ovmf_var::{OvmfParamsBootMode, OvmfParamsFdeBoot},
     quote::*,
-    rsa_ext::RsaPublicKeyExt,
     disk::crypt_setup,
 };
 
@@ -46,16 +44,10 @@ async fn main() -> Result<()> {
     }
 
     // In the GET_QUOTE boot mode, only retrieve the quote and end the boot.
-    // In the TD_FDE_BOOT boot mode, retrieve the root filesystem key from the KBS and unencrypt the root filesystem.
+    // In the TD_FDE_BOOT boot mode, retrieve the root filesystem encryption key from the KBS and unencrypt the root filesystem.
     if td_boot_mode == "GET_QUOTE" {
-        let get_quote_params = OvmfParamsGetQuote::new()?;
-        // Put hash of public part of key retrieval key into report data structure.
-        let report_data = tdx_attest_rs::tdx_report_data_t {
-            d: get_quote_params.pk_kr.sha512_digest(),
-        };
-
-        // Retrieve TD quote using the prepared report data.
-        let quote = Quote::retrieve_quote(&report_data)?;
+        // Retrieve TD quote.
+        let quote = Quote::retrieve_quote(None)?;
 
         // Print base 64 encoded TD Quote.
         let quote_b64 = quote.get_raw_base64().ok_or_else(|| anyhow!("Failed to get base64 quote"))?;
@@ -67,42 +59,22 @@ async fn main() -> Result<()> {
         println!("Stop further boot in GET_QUOTE boot mode");
         std::process::exit(1);
     } else if td_boot_mode == "TD_FDE_BOOT" {
-
-       // Generate RSA key pair used for key retrieval.
-       let sk_kr = RsaPrivateKey::new(&mut OsRng, 3072).expect("Failed to generate private key");
-       let pk_kr = RsaPublicKey::from(&sk_kr);
-
-           // Put hash of public part of key retrieval key into report data structure.
-           let report_data = tdx_attest_rs::tdx_report_data_t {
-            d: pk_kr.sha512_digest(),
-        };
-
-        // Retrieve TD quote using the prepared report data.
-        let quote = Quote::retrieve_quote(&report_data)?;
-
-        // Prepare retrieval request for root filesystem key.
+        // Prepare retrieval request for root filesystem encryption key.
         let fde_boot_params = OvmfParamsFdeBoot::new()?;
         let kbs_url = String::from_utf8(fde_boot_params.kbs_url)?;
         let kbs_k_rfs_id = String::from_utf8(fde_boot_params.kbs_k_rfs_id)?;
 
-        let req_body = format!(
-            r#"{{"quote":"{}","user_data":"{}"}}"#,
-            quote.get_raw_base64().expect("Failed to get base64 quote"),
-            pk_kr.base64_encoded()
-        )
-        .replace("\n", "");
-
-        // Retrieve root filesystem key from KBS.
+        // Retrieve root filesystem encryption key from KBS.
         let kbs_cert_path = String::from("/etc/kbs.crt");
-        let kbs = ItaKbs::new(kbs_url, kbs_cert_path)?;
-        let mut k_rfs = kbs.retrieve_k_rfs(req_body, sk_kr, kbs_k_rfs_id)
-            .expect("Failed to retrieve root filesystem key");
+        let kbs = TrusteeKbsClient::new(kbs_url, kbs_cert_path)?;
+        let k_rfs = Zeroizing::new(
+            kbs.retrieve_k_rfs(kbs_k_rfs_id).await
+                .map_err(|e| anyhow!("Failed to retrieve root filesystem encryption key: {}", e))?
+        );
 
-        // Decrypt root filesystem partition using retrieved root filesystem key.
-        crypt_setup(label_part_rootfs_enc.to_string(), label_dev_rootfs_dec.to_string(), &k_rfs);
-
-        // Securely erase root filesystem key from memory.
-        k_rfs.zeroize();
+        // Decrypt root filesystem partition using retrieved root filesystem encryption key.
+        // k_rfs is automatically zeroized when dropped (on success, error, or panic).
+        crypt_setup(label_part_rootfs_enc, label_dev_rootfs_dec, &k_rfs);
 
         Ok(())
     } else {

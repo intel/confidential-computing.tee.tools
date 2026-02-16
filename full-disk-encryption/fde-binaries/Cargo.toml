@@ -11,8 +11,8 @@ name = "fde-decrypt-image"
 path = "src/fde-decrypt-image.rs"
 
 [[bin]]
-name = "fde-key-gen"
-path = "src/fde-key-gen.rs"
+name = "fde-kbs-store-key"
+path = "src/fde-kbs-store-key.rs"
 
 [lib]
 name = "utils"
@@ -24,26 +24,15 @@ strip = true  # Automatically strip symbols from the binary
 [dependencies]
 base64 = "0.22.1"
 clap = { version = "4.5.53", features = ["derive"] }
-cryptsetup-rs = "0.3.2"
-log = "0.4.27"
 anyhow = "1.0.100"
 reqwest = { version = "0.12.24", features = ["rustls-tls", "json", "blocking"], default-features = false}
-rustls = "0.23.27"
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.145"
 tokio = { version = "1.48.0", features = ["rt-multi-thread", "macros"] }
 efivar = "2.0.0"
-uuid = {version = "1.16.0", features = ["v5", "macro-diagnostics"]}
 zeroize = "1.8.2"
-webpki-roots = "1.0.0"
-rsa = { version = "0.9.9", features = ["sha2", "pem"] }
-pkcs1 = "0.7.5"
-sha2 = "0.10.9"
-rand = "0.9.1"
-aes-gcm = "0.10.3"
-generic-array = "1.2.0"
 tdx-attest-rs = { git = "https://github.com/intel/SGXDataCenterAttestationPrimitives", tag = "DCAP_1.23" }
 hex = "0.4.3"
-
-[build-dependencies]
-pkg-config = "0.3.32"
+jwt-simple = { version = "0.12", default-features = false, features = [
+    "pure-rust",
+] }
+kbs_protocol = { git = "https://github.com/confidential-containers/guest-components.git", tag = "v0.15.0", features = ["tdx-attester"] }

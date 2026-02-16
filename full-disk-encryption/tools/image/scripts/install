@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Copyright (C) 2025 Intel Corporation
+# Copyright (C) 2025 - 2026 Intel Corporation
 # SPDX-License-Identifier: BSD-3-Clause
 
 PART_ROOT=$1
@@ -11,8 +11,8 @@ set -e
 
 echo "Guest OS installation script called with PART_ROOT=${PART_ROOT}, LABEL_PART_ROOTFS_ENC=${LABEL_PART_ROOTFS_ENC}, LABEL_DEV_ROOTFS_DEC=${LABEL_DEV_ROOTFS_DEC}"
 
-## Install packages
-apt update && apt install --yes --allow-downgrades shim-signed grub-efi-amd64-signed grub-efi-amd64-bin libtdx-attest-dev
+# Install packages
+apt update && apt install --yes --allow-downgrades shim-signed grub-efi-amd64-signed grub-efi-amd64-bin libtss2-dev
 
 # Install Grub2
 grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=ubuntu
