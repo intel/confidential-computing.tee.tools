@@ -157,19 +157,52 @@ function process_args() {
         fi
     done
 
-    while getopts "h:r:b:p:k:i:u:c:e:" option; do
+    # Reject OPTARG values that look like flags or are empty or are negative numbers.
+    _require_value() {
+        local value="$1"
+        local opt="$2"
+
+        value=$(printf '%s' "$value" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//') # Remove leading and trailing whitespaces
+
+        # Reject empty values
+        if [[ -z "$value" ]]; then
+            echo "Error: Option '-${opt}' requires a non-empty value (got '${1:-<nothing>}')"
+            usage
+            exit 1
+        fi
+
+        # Reject values starting with '-' (either a negative number or a consumed flag)
+        if [[ "$value" == -* ]]; then
+            if [[ ("$opt" == "r" || "$opt" == "b") && "$value" =~ ^-[0-9] ]]; then
+                echo "Error: Option '-${opt}' requires a positive size value (got '${value}')"
+            else
+                echo "Error: Option '-${opt}' requires a non-empty value (got '${value}')"
+            fi
+            usage
+            exit 1
+        fi
+
+        OPTARG="$value"
+    }
+
+    while getopts ":hr:b:p:k:i:u:c:e:" option; do
         case "$option" in
-        r) SIZE_PART_ROOTFS=$OPTARG ;;
-        b) SIZE_PART_BOOT=$OPTARG ;;
-        p) PATH_IMG_IN=$OPTARG ;;
-        k) K_RFS_HEX=$OPTARG ;;
-        i) ID_K_RFS=$OPTARG ;;
-        u) KBS_URL=$OPTARG ;;
-        c) KBS_CERT_PATH=$OPTARG ;;
-        e) PATH_IMG_OUT=$OPTARG ;;
+        r) _require_value "$OPTARG" r; SIZE_PART_ROOTFS=$OPTARG ;;
+        b) _require_value "$OPTARG" b; SIZE_PART_BOOT=$OPTARG ;;
+        p) _require_value "$OPTARG" p; PATH_IMG_IN=$OPTARG ;;
+        k) _require_value "$OPTARG" k; K_RFS_HEX=$OPTARG ;;
+        i) _require_value "$OPTARG" i; ID_K_RFS=$OPTARG ;;
+        u) _require_value "$OPTARG" u; KBS_URL=$OPTARG ;;
+        c) _require_value "$OPTARG" c; KBS_CERT_PATH=$OPTARG ;;
+        e) _require_value "$OPTARG" e; PATH_IMG_OUT=$OPTARG ;;
         h)
             usage
             exit 0
+            ;;
+        :)
+            echo "Error: Option '-$OPTARG' requires a value"
+            usage
+            exit 1
             ;;
         *)
             echo "Invalid option '-$OPTARG'"
