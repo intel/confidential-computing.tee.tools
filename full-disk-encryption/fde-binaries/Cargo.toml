@@ -25,7 +25,7 @@ strip = true  # Automatically strip symbols from the binary
 base64 = "0.22.1"
 clap = { version = "4.5.53", features = ["derive"] }
 anyhow = "1.0.100"
-reqwest = { version = "0.12.24", features = ["rustls-tls", "json", "blocking"], default-features = false}
+reqwest = { version = "0.13.2", features = ["rustls", "json", "blocking"], default-features = false}
 serde = { version = "1.0.228", features = ["derive"] }
 tokio = { version = "1.48.0", features = ["rt-multi-thread", "macros"] }
 efivar = "2.0.0"
