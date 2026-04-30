@@ -54,7 +54,8 @@ function cleanup_resources() {
     fi
 
     # If any nbd is connected to base image, disconnect it.
-    local nbd_line=$(ps m -C qemu-nbd --no-headers | grep "$PATH_IMG_IN")
+    local nbd_line
+    nbd_line=$(ps m -C qemu-nbd --no-headers | grep "$PATH_IMG_IN") || true
     if [ -n "$nbd_line" ]; then
         # Extract the nbd device (e.g., /dev/nbd0)
         local nbd_device
