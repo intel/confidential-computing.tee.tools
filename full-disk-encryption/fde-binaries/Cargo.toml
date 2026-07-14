@@ -35,4 +35,4 @@ hex = "0.4.3"
 jwt-simple = { version = "0.12", default-features = false, features = [
     "pure-rust",
 ] }
-kbs_protocol = { git = "https://github.com/confidential-containers/guest-components.git", tag = "v0.15.0", features = ["tdx-attester"] }
+kbs_protocol = { git = "https://github.com/confidential-containers/guest-components.git", tag = "v0.15.0", default-features = false, features = ["background_check", "rust-crypto", "tdx-attester"] }
